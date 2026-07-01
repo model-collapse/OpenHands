@@ -229,6 +229,24 @@ inside `store.transition` etc. Exposed separately for non-state events
 The one abstraction that makes members interchangeable. Kind-aware; returns the
 new `conversation_id`.
 
+**Single source of truth = the `agents` row.** A spawn is a pure function of the
+member's stored definition plus the issue — no agent config is invented at spawn
+time. This makes every spawn reproducible and the roster fully trackable:
+
+- The `agents` table (§1) holds *everything* a member is: `agent_kind`,
+  `acp_server`, `llm_model`, `launch_config_json`, `skills_json`,
+  `created_by_role`. `spawn.py` reads that row and nothing else.
+- **Why not OpenHands "profiles" as the SoT?** Verified in code: both the SDK
+  `LLMProfileStore` and app-server `LLMProfiles` persist a bare **`LLM`** (model /
+  base_url / key) — they carry *no* `agent_kind`, ACP command, or skills, so a
+  profile cannot describe an ACP/Claude-Code member. Profiles are therefore *not*
+  the source of truth. An OpenHands member *may* reference a saved LLM profile by
+  name **inside its `launch_config_json`** as a reusable LLM sub-config, but the
+  `agents` row remains authoritative.
+- **Roster changes are audited.** Creating/reconfiguring/disabling a member
+  writes an event (`form_member` / `reconfigure_member` / `disable_member`), so
+  "what was this agent configured as when it did X" is answerable from the spine.
+
 ```python
 class AgentSpawner:
     def __init__(self, self_url: str, store: TeamStore): ...
@@ -242,12 +260,14 @@ class AgentSpawner:
                                 "content": [{"type": "text", "text": instruction}],
                                 "run": run},
         }
+        # Config is derived ENTIRELY from the stored agents row (the SoT).
         if agent.agent_kind == "openhands":
             if agent.llm_model: payload["llm_model"] = agent.llm_model
-            # skills/agent config applied via profile or agent_settings (see below)
+            # openhands skills/agent settings from agent.skills_json /
+            # agent.launch_config_json (may name a reusable LLM profile)
         elif agent.agent_kind == "acp":
-            # per §12: ACP is first-class; agent_kind/acp_server carried via the
-            # member's saved profile OR a per-request agent field.
+            # ACP is first-class (design §12); acp_server/acp_model/command from
+            # the row's launch_config_json.
             payload["agent"] = agent.launch_config_json  # {agent_kind:'acp', acp_server:..., acp_model:...}
         cid = await POST(f"{self_url}/api/v1/app-conversations", payload)
         record_event(self.store, issue_id=issue.id, actor_role=role,
@@ -255,10 +275,12 @@ class AgentSpawner:
         return cid
 ```
 
-**Open implementation detail (spiked in Phase 2):** whether per-member agent
-config rides `POST /app-conversations` as an `agent` field or as a **saved LLM
-profile per member** (the app-server already supports profiles + `switch_profile`).
-The spike picks one; `spawn.py` hides it behind this interface either way.
+**What Phase 2 spikes is the *transport*, not the source of truth.** The SoT is
+settled (the `agents` row, above). The spike only picks how that row is handed to
+`POST /app-conversations`: an inline `agent` field on the request, vs.
+materializing a per-member saved LLM profile the request references. Both read
+*from* the same authoritative row; `spawn.py` hides the choice behind this
+interface.
 
 Every spawned conversation's `conversation_id` is stored on the comment/event so
 the cockpit can deep-link to the on-disk sandbox events (the reasoning).
@@ -402,10 +424,13 @@ exactly one event; state cannot change without an event (test asserts the raw
 UPDATE is unreachable outside `store`); `labels_to_state` round-trips.
 
 **P2 — ACP spike + bootstrap.** First run an ACP/Claude-Code conversation on this
-box (close the one real unknown, design §12). Then `spawn.py`, `bootstrap.py`.
+box (close the one real unknown, design §12) and pick the spawn *transport* (§4).
+Then `spawn.py`, `bootstrap.py`.
 ✅ *Accept:* spawn an `openhands` member and an `acp` member for a trivial task,
-both return a `conversation_id` and produce output; `bootstrap` creates a `lead`
-row and, from a formation reply, writes ≥1 member row (all as events).
+both return a `conversation_id` and produce output; **each spawn's config is
+derived solely from its `agents` row** (no ad-hoc config — re-spawning the same
+row is reproducible); `bootstrap` creates a `lead` row and, from a formation
+reply, writes ≥1 member row, each as a `form_member` event.
 
 **P3 — Sync bridge.** `sync.py` import-in + label-change detection + publish-out;
 reuse poller helpers.
