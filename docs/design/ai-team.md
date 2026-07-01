@@ -1,11 +1,23 @@
 # AI Team on OpenHands — Design Doc
 
-**Status:** Draft for review · **Author:** design session, 2026-07-01
+**Status:** Revised after grand-leader review · **Author:** design session, 2026-07-01
 **Scope:** A supervised, multi-agent "engineering team" built on the OSS OpenHands
 stack, using an internal issue system as the collaboration substrate and GitHub
 as an external gateway owned by a single lead identity.
 
 > Design doc for the AI-team feature, developed in the `model-collapse/OpenHands` fork.
+
+**Grand-leader decisions (2026-07-01), applied throughout:**
+1. **Commit gate → the team lead decides** whether to commit an issue for
+   implementation (not the human). See §5, §9.
+2. **Debug is read-first.** The human's actions are *influence directed at the
+   lead*, not direct edits to issues/state. See §9.
+3. **Roster is bootstrapped, not fixed.** We first spawn a **Team Lead agent**;
+   the grand leader converses with the lead, and the lead *builds its own team* —
+   configuring each member one by one, where a member may be an OpenHands agent
+   or a Claude Code / ACP agent, and loading the appropriate skills for each.
+   See §2 + new §2b.
+4. **v1 scope = the full machine** (not a thin slice). See §11.
 
 ---
 
@@ -47,19 +59,58 @@ stop* the agents before we build more autonomy.
 ## 2. Identity model
 
 ```
-Grand Leader (human)         role=grand_leader   — override authority, above all
-   └── Team Lead (agent)     role=lead           — OWNS the GitHub identity (gateway)
-          ├── Engineer       role=eng:backend, eng:frontend, ...
-          └── Specialist     role=reviewer, researcher, ...
+Grand Leader (human)         role=grand_leader   — supervises + influences the lead
+   └── Team Lead (agent)     role=lead           — OWNS the GitHub identity (gateway);
+          │                                        decides commits; BUILDS the team
+          ├── Engineer       role=eng:*    kind ∈ {openhands, acp}   — configured by lead
+          └── Specialist     role=reviewer/researcher/...            — configured by lead
 ```
 
 - Only `lead` has a `github_identity`. All GitHub reads/writes go through it.
-- Agents are **not** long-lived processes. A "role acting" == spawning an
-  OpenHands conversation for that role with the relevant issue context. A
-  mention/assignment is an enqueued task, not a running daemon.
-- The `grand_leader` is a real role in the internal system whose comments carry
-  **override authority** the lead sweep must honor (force-commit, reassign,
-  deprioritize, halt).
+- **The roster is not hard-coded — the lead constructs it** (see §2b). Roles
+  below the lead are created at runtime by the lead, each with a chosen agent
+  **kind** and a **skill set**.
+- **Agent kind is heterogeneous.** A member is either:
+  - `openhands` — runs via the app-server's own conversation/sandbox path
+    (`POST /api/v1/app-conversations`), or
+  - `acp` — an external ACP agent (e.g. Claude Code / Codex / Gemini) launched
+    through OpenHands' ACP support.
+  The `agents` table records `kind` + launch config so the reactive router knows
+  how to spawn each member; the rest of the state machine is kind-agnostic.
+- Agents are **not** long-lived processes. A "role acting" == spawning a
+  conversation for that role (OpenHands or ACP) with the relevant issue context.
+  A mention/assignment is an enqueued task, not a running daemon.
+- The `grand_leader` is a real role in the internal system, but is
+  **influence-only** (read-first supervision): its comments are authoritative
+  *guidance the lead must weigh*, not direct state edits. The lead remains the
+  actor that changes issue state (including the commit decision). See §9.
+
+---
+
+## 2b. Team bootstrap (how the roster comes to exist)
+
+The team is **grown, not declared**. Lifecycle:
+
+1. **Spawn the lead.** On enable, the system creates exactly one agent — the
+   Team Lead — with the GitHub identity and a "team-formation" skill set.
+2. **Grand leader ↔ lead conversation.** The human talks to the lead (via the
+   lead's own conversation, or via a GitHub `internal` issue) about the project's
+   needs: what repos, what kinds of work, how many engineers, what specialties.
+3. **Lead configures members one by one.** For each member the lead decides:
+   - `role` (e.g. `eng:backend`, `reviewer`),
+   - `kind` (`openhands` or `acp` — e.g. a Claude Code agent),
+   - `llm_model` / launch config,
+   - **skills to load** for that member (from the OpenHands skills system and/or
+     ACP agent config),
+   and writes an `agents` row. Team formation is itself auditable (events).
+4. **Roster is mutable.** The lead can add, reconfigure, disable, or replace
+   members later (e.g. add a `frontend` engineer when a UI issue arrives). The
+   grand leader can *influence* these choices but the lead executes them.
+
+Implication for the data model: `agents` is written at runtime, not seeded from
+a config file, and carries enough launch config to spawn either agent kind
+(§4). Team-formation actions are first-class events so the human can see *why*
+the lead shaped the team as it did.
 
 ---
 
@@ -100,8 +151,15 @@ Three cooperating modules, all **in-process lifespans** of the app-server
 Kept deliberately tight. All timestamps ISO-8601 UTC.
 
 ```
-agents(role PK, display_name, kind[human|agent], github_identity NULL,
-       llm_model NULL, enabled)
+agents(role PK, display_name,
+       actor_kind[human|agent],           -- human (grand_leader) vs agent
+       agent_kind[openhands|acp] NULL,     -- for agents: how to spawn (§2)
+       github_identity NULL,               -- only the lead has one
+       llm_model NULL,
+       launch_config_json NULL,            -- ACP command / OpenHands agent cfg
+       skills_json NULL,                   -- skills the lead loaded for this member
+       created_by_role NULL,               -- 'lead' for members it forms (§2b)
+       enabled)
 
 issues(id PK, origin[internal|github], github_ref NULL,           -- e.g. "owner/repo#12"
        title, body, author_role, assignee_role NULL,
@@ -150,7 +208,7 @@ on disk. Nothing the agents do is allowed to bypass it.
                          ▼                                      │
                     ┌───────────┐                              │
                     │ committed │ ◄────────────────────────────┘
-                    │  (GATE)   │   ← grand-leader / lead green-light
+                    │  (GATE)   │   ← LEAD decides (weighing grand-leader influence)
                     └─────┬─────┘
                           ▼  == existing full-auto engineer path
                     ┌───────────┐        ┌──────┐        ┌────────┐
@@ -167,6 +225,10 @@ Key points:
 - **Two issue origins, one machine.** Type-2 internal issues skip external
   triage and enter at `internal`; priority-weighting is the lead setting
   `priority:*`.
+- **The lead owns the commit gate.** Advancing to `committed` is the lead's
+  decision (after the assignee accepts or the negotiation is force-resolved).
+  The grand leader *influences* this via guidance the lead must weigh (§9), but
+  does not flip the gate directly.
 
 ---
 
@@ -190,8 +252,10 @@ For each open issue, branch on state:
 Fires when the poller sees a new comment or label change:
 - comment on `waiting:<role>` → spawn that role's conversation to respond
   (assignee evaluates feasibility *by cloning and inspecting the repo* — see §8).
-- `committed` label added → spawn engineer (full-auto path).
-- grand-leader override comment → apply immediately, bypass normal flow.
+  Spawn respects the member's `agent_kind` (OpenHands conversation or ACP agent).
+- `committed` label added → spawn engineer (full-auto path), per its kind.
+- grand-leader guidance comment → route to the **lead** as high-priority
+  influence (not a direct state change); the lead acts on it (§9).
 
 **Separation of concerns:** reactive = respond to a single event; sweep = review
 the whole board and make decisions. Don't triage in the reactive loop (partial,
@@ -235,15 +299,27 @@ information**. Guardrails:
 
 ---
 
-## 9. The human's intervention channel (v1 decision)
+## 9. The human's intervention channel — influence, not direct control
 
-**v1: intervene through GitHub.** The grand leader comments on the real GitHub
-issue as themselves; the lead ingests it as an authoritative `grand_leader`
-directive. Rationale: zero new UI to trust, works from the tool the human
-already lives in, reuses the poller. The cockpit is **read-mostly** in v1.
+Per grand-leader decision, oversight is **read-first**, and the human's actions
+are **influence directed at the lead**, not direct edits to issue state.
 
-**v2 (optional):** direct override in the internal cockpit (richer, but new
-surface + new trust burden). Deferred until the read-only cockpit proves useful.
+- **Channel (v1): through GitHub.** The grand leader comments on the real GitHub
+  issue (or an `internal` issue / the lead's conversation) as themselves. The
+  lead ingests it as **high-priority guidance it must weigh** — then the *lead*
+  takes the resulting action (commit, reassign, reprioritize, halt). Rationale:
+  zero new UI to trust, works from the tool the human already lives in, reuses
+  the poller.
+- **Not a direct override.** The human does not flip labels/state himself; he
+  shapes the lead's decisions. This keeps a single, coherent actor (the lead)
+  responsible for state, with the human as the influencing supervisor above it.
+  Guidance is recorded as events so its effect on the lead's choices is auditable.
+- **Escape hatch:** a hard `halt`/`stop` directive is honored immediately by the
+  lead sweep (stop spawning, pause the issue) — influence is strong enough to
+  arrest a runaway, even though it flows through the lead.
+
+The cockpit is **read-mostly** in v1 (observe + drill into reasoning); it does
+not expose direct state-mutation controls.
 
 ---
 
@@ -264,22 +340,33 @@ what failed" and drill to *why* in one click.
 
 ---
 
-## 11. Build order (observability spine first)
+## 11. Build order — v1 is the FULL machine
+
+Grand-leader decision: build the complete system, not a thin slice. Order is by
+dependency (observability spine still comes first, because the human must be able
+to *see and stop* the agents before they run autonomously), but all of it is v1.
 
 1. **Event/audit spine + data model** (`team_issues/` store, `events` table,
-   conversation linkage). Nothing else works without this.
-2. **Sync bridge**: repurpose `github_poller` → import external issues in with
-   provenance + `sync_map`; publish lead output out. Echo-loop tests.
-3. **Read-only cockpit** (`/api/v1/team/dashboard`, issue drill-down to events).
-4. **Lead sweep loop** (triage → assign; convergence authority; escalation).
-5. **Reactive router** (assignee-evaluates-with-repo-context; committed→execute
-   reuses existing full-auto path).
-6. **Grand-leader override via GitHub** ingestion.
-7. *Then* iterate on negotiation richness — only if §8 grounding proves it adds
-   signal.
+   conversation linkage, `agents` with `agent_kind`/skills). Nothing else works
+   without this.
+2. **Team bootstrap** (§2b): spawn the lead; grand-leader ↔ lead formation
+   conversation; lead writes `agents` rows (OpenHands or ACP members, with
+   skills). Roster is runtime-built.
+3. **Sync bridge**: repurpose `github_poller` → import external issues in with
+   provenance + `sync_map`; publish lead output out. Echo-loop tests. Add the
+   **label-change detection** path (§12) needed for state transitions.
+4. **Read-only cockpit** (`/api/v1/team/dashboard`, issue drill-down to events,
+   roster view).
+5. **Lead sweep loop** (triage → assign; lead-owned commit gate; convergence
+   authority; escalation).
+6. **Reactive router** (assignee-evaluates-with-repo-context; kind-aware spawn
+   for OpenHands *and* ACP members; committed→execute reuses the full-auto path).
+7. **Grand-leader influence via GitHub** ingestion (routes to lead as guidance).
+8. Negotiation richness / heterogeneous-agent tuning as the machine runs.
 
-This inverts a "collaboration-first" ordering: because the human must *observe
-and stop* autonomous agents, the observability + control spine comes first.
+Because v1 is the full machine, plan for the added surface of §2b (team
+formation) and kind-aware spawning (ACP + OpenHands) from the start, rather than
+bolting them on.
 
 ---
 
@@ -293,6 +380,14 @@ and stop* autonomous agents, the observability + control spine comes first.
 - Identity: today all actions use one token. This design *embraces* that at the
   GitHub boundary but requires internal roles to be modeled distinctly (the
   `agents` table). No new GitHub accounts needed for v1.
+- **Heterogeneous agent kinds:** members may be OpenHands agents *or* ACP agents
+  (Claude Code / Codex / Gemini). The reactive router must spawn each per its
+  `agent_kind`. OpenHands spawn is proven (full-auto path); the **ACP spawn +
+  skill-loading path is new integration work** and the main unknown in the
+  bootstrap (§2b). De-risk it early.
+- **Label-change detection:** the state machine needs firing on *label added to
+  an existing issue*, which the current poller does not do (it triggers on issue
+  creation / @mention). New detection path required (§11 step 3).
 - "Always-on": still requires the backend to run as a persistent service to be
   meaningful (unchanged from prior discussion).
 
@@ -314,19 +409,32 @@ and stop* autonomous agents, the observability + control spine comes first.
 
 ---
 
-## 14. Open questions for the grand leader
+## 14. Resolved decisions (grand leader, 2026-07-01)
 
-1. **Commit gate authority:** does the human always hold the final `committed`
-   gate (agents negotiate, human commits — safer), or may the lead commit
-   autonomously once the assignee accepts? (Recommendation: human holds the gate
-   in v1.)
-2. **Debug emphasis:** is "debug" mostly *reading* (understand why) or *acting*
-   (redirect)? Decides how much of v1 is dashboard vs. override tooling.
-   (Recommendation: reading-first; override via GitHub.)
-3. **Roster:** which roles exist in v1? (Recommendation: `lead`, one
-   `eng:general`, `reviewer` — smallest set that exercises assign→negotiate→
-   commit→execute→review.)
-4. **Scope of v1 slice:** build the full machine, or first prove
-   triage→commit→execute on one repo (`diagon`) with the event spine + read-only
-   cockpit, then add negotiation? (Recommendation: the latter.)
+1. **Commit gate authority → the LEAD decides.** The team lead determines whether
+   an issue is committed for implementation. The grand leader influences but does
+   not hold the gate. (Applied: §5, §6a, §9.)
+2. **Debug emphasis → read-first.** The human's actions are *influence on the
+   lead*, not direct state edits. Cockpit is read-mostly; no direct-mutation
+   controls in v1. (Applied: §9, §10.)
+3. **Roster → bootstrapped by the lead.** Do not pre-declare roles. Spawn the
+   Team Lead agent first; the grand leader converses with the lead; the lead
+   forms the team, configuring each member (OpenHands *or* ACP/Claude-Code kind)
+   and loading its skills. (Applied: §2, new §2b, §4 `agents` schema.)
+4. **v1 scope → the full machine.** Build the complete system, not a thin slice.
+   (Applied: §11.)
+
+### Remaining questions surfaced by the decisions
+
+- **ACP integration depth:** exactly how does the lead launch and load skills
+  into an ACP agent (Claude Code) as a team member? This is the main new unknown
+  (§12) — spike it during §11 step 2.
+- **Formation UX:** does the grand-leader ↔ lead team-formation conversation
+  happen in the lead's OpenHands conversation, or via a dedicated GitHub
+  `internal` issue thread? (Both are viable; the latter keeps formation auditable
+  in the same substrate as everything else.)
+- **Runaway safety with a lead-owned gate:** since the lead now commits
+  autonomously, confirm the `halt` escape hatch (§9) and per-sweep budgets are
+  sufficient guardrails, or whether high-cost/high-risk issues should still
+  require explicit grand-leader assent before `committed`.
 ```
