@@ -186,12 +186,18 @@ class ProcessSandboxService(SandboxService):
             process = psutil.Process(process_info.pid)
             if process.is_running():
                 status = process.status()
-                if status == psutil.STATUS_RUNNING:
-                    return SandboxStatus.RUNNING
-                elif status == psutil.STATUS_STOPPED:
+                if status == psutil.STATUS_STOPPED:
                     return SandboxStatus.PAUSED
+                elif status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                    return SandboxStatus.MISSING
                 else:
-                    return SandboxStatus.STARTING
+                    # Any other live state (running, sleeping, disk-sleep, ...)
+                    # is treated as RUNNING. A healthy server sitting on its
+                    # event loop reports STATUS_SLEEPING almost all the time;
+                    # actual readiness is gated by the /alive check in
+                    # _process_to_sandbox_info, which downgrades to ERROR if
+                    # the agent server does not respond.
+                    return SandboxStatus.RUNNING
             else:
                 return SandboxStatus.MISSING
         except (psutil.NoSuchProcess, psutil.AccessDenied):
