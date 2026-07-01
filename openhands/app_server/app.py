@@ -50,6 +50,25 @@ app_lifespan_ = get_app_lifespan_service()
 if app_lifespan_:
     lifespans.append(app_lifespan_.lifespan)
 
+# Optional GitHub poller: an in-process service that polls GitHub and starts
+# conversations on issue/comment triggers. Opt-in via ENABLE_GITHUB_POLLER so
+# it is inert in tests and deployments that don't want it. Accepts 'true'/'1'.
+_github_poller_enabled = os.getenv('ENABLE_GITHUB_POLLER', 'false').lower() in (
+    'true',
+    '1',
+)
+if _github_poller_enabled:
+    from openhands.app_server.github_poller.service import get_github_poller_service
+
+    _github_poller = get_github_poller_service()
+
+    @contextlib.asynccontextmanager
+    async def _github_poller_lifespan(app):
+        async with _github_poller:
+            yield
+
+    lifespans.append(_github_poller_lifespan)
+
 
 app = FastAPI(
     title='OpenHands',
@@ -70,6 +89,14 @@ async def authentication_error_handler(request: Request, exc: AuthenticationErro
 
 app.include_router(v1_router.router)
 app.include_router(health_router)
+
+if _github_poller_enabled:
+    from openhands.app_server.github_poller.router import (
+        router as github_poller_router,
+    )
+
+    # Mounted under /api/v1 so it shares host/port with the rest of the app.
+    app.include_router(github_poller_router, prefix='/api/v1')
 
 # Middleware and static file setup (merged from listen.py)
 if os.getenv('SERVE_FRONTEND', 'true').lower() == 'true':
