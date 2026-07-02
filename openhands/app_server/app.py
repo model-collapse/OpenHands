@@ -116,9 +116,15 @@ if _github_poller_enabled:
     app.include_router(github_poller_router, prefix='/api/v1')
 
 if _ai_team_enabled:
-    from openhands.app_server.team.router import router as team_router
+    from openhands.app_server.team.router import (
+        compat_router as team_compat_router,
+    )
+    from openhands.app_server.team.router import (
+        router as team_router,
+    )
 
     app.include_router(team_router, prefix='/api/v1')
+    app.include_router(team_compat_router, prefix='/api/v1')
 
 # Middleware and static file setup (merged from listen.py)
 if os.getenv('SERVE_FRONTEND', 'true').lower() == 'true':

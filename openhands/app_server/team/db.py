@@ -196,23 +196,58 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         'enabled, created_at) VALUES (?,?,?,?,1,?)',
         (DEFAULT_TEAM_ID, DEFAULT_TEAM_ID, identity, repos_json, now),
     )
-    # Add team_id to each old table and backfill 'default'. (SQLite lets us add
-    # a NOT NULL column only with a default; use a literal default then it's set
-    # on every existing row.)
-    for table in ('agents', 'issues', 'comments', 'events', 'inbox', 'sync_map', 'kv'):
+
+    # Tables whose PRIMARY KEY does NOT change (id / autoincrement) — just add a
+    # team_id column and backfill 'default'.
+    for table in ('issues', 'comments', 'events'):
         if _table_exists(conn, table) and 'team_id' not in _table_columns(conn, table):
             conn.execute(
                 f'ALTER TABLE {table} ADD COLUMN team_id TEXT NOT NULL '
                 f"DEFAULT '{DEFAULT_TEAM_ID}'"
             )
+
+    # Tables whose PRIMARY KEY CHANGES (role -> (team_id, role), etc.). SQLite
+    # can't alter a PK, so rename→recreate (via _SCHEMA, run right after this)→
+    # copy→drop. We rename the old table aside here and let init_db's executescript
+    # create the new one, then copy in the tail of this function.
+    for table in ('agents', 'inbox', 'sync_map', 'kv'):
+        if _table_exists(conn, table) and 'team_id' not in _table_columns(conn, table):
+            conn.execute(f'ALTER TABLE {table} RENAME TO {table}__v1')
+    conn.commit()
+
+
+def _copy_v1_pk_tables(conn: sqlite3.Connection) -> None:
+    """Second half of the v1->v2 migration: copy rows from the renamed ``*__v1``
+    tables (PK-changed tables) into the fresh v2 tables, then drop the old ones.
+    Runs after ``_SCHEMA`` has created the v2 tables."""
+    copies = {
+        'agents': (
+            'role, display_name, actor_kind, agent_kind, acp_server, '
+            'github_identity, llm_model, launch_config_json, skills_json, '
+            'created_by_role, enabled, created_at'
+        ),
+        'inbox': 'role, issue_id, reason, created_at',
+        'sync_map': 'internal_id, github_ref, kind, last_synced_at',
+        'kv': 'key, value',
+    }
+    for table, cols in copies.items():
+        if _table_exists(conn, f'{table}__v1'):
+            conn.execute(
+                f'INSERT OR IGNORE INTO {table}(team_id, {cols}) '
+                f"SELECT '{DEFAULT_TEAM_ID}', {cols} FROM {table}__v1"
+            )
+            conn.execute(f'DROP TABLE {table}__v1')
     conn.commit()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     """Create/upgrade the schema idempotently and stamp the version."""
-    # Migrate a v1 db BEFORE creating v2 tables, so the ALTERs see old tables.
+    # v1->v2: renames PK-changing tables aside + adds team_id to the others.
     _migrate_v1_to_v2(conn)
+    # Create the v2 tables (including fresh agents/inbox/sync_map/kv).
     conn.executescript(_SCHEMA)
+    # Copy rows from the renamed *__v1 tables into the fresh v2 tables.
+    _copy_v1_pk_tables(conn)
     conn.execute(
         'INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)',
         ('schema_version', SCHEMA_VERSION),

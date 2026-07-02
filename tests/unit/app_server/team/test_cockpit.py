@@ -1,9 +1,9 @@
-"""P4 tests: the read-only cockpit router.
+"""v2 cockpit tests: team-scoped read API + teams collection + create + UI.
 
-Mounts just the team router on a bare FastAPI app, backed by a temp-file store
-injected via the module singleton. Verifies the attention filter, issue
-drill-down (event timeline with conversation links), and that there are no
-state-mutation endpoints.
+Mounts the team routers on a bare FastAPI app, backed by a temp store injected
+via the module singleton. Verifies the teams list/create, the attention filter,
+issue drill-down (event timeline with conversation links), and that the read
+routes don't mutate issue state.
 """
 
 from __future__ import annotations
@@ -29,92 +29,98 @@ from openhands.app_server.team.models import (
 from openhands.app_server.team.service import TeamService
 from openhands.app_server.team.store import TeamStore
 
+DEFAULT = 'default'
+
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    store = TeamStore(db_path=str(tmp_path / 'team.db'))
+def ctx(tmp_path, monkeypatch):
+    base = TeamStore(db_path=str(tmp_path / 'team.db'), team_id=DEFAULT)
+    base.create_team(team_id=DEFAULT, name='default', github_identity='mc')
     svc = TeamService(config=TeamConfig.from_env())
-    svc._store = store  # inject the temp store
-    # Point the module singleton at our service for the duration of the test.
+    svc._base_store = base
     monkeypatch.setattr(team_service_mod, '_service', svc)
 
     app = FastAPI()
     app.include_router(team_router_mod.router, prefix='/api/v1')
-    yield TestClient(app), store
-    store.close()
+    app.include_router(team_router_mod.compat_router, prefix='/api/v1')
+    yield TestClient(app), base
+    base.close()
 
 
-def test_health(client):
-    tc, store = client
-    r = tc.get('/api/v1/team/health')
+# -- teams collection ------------------------------------------------------
+def test_list_teams(ctx):
+    tc, base = ctx
+    r = tc.get('/api/v1/teams')
     assert r.status_code == 200
-    assert r.json()['status'] == 'ok'
+    ids = [t['id'] for t in r.json()['items']]
+    assert DEFAULT in ids
 
 
-def test_dashboard_attention_filter_hides_normal_work(client):
-    tc, store = client
-    # a normal in-progress issue should NOT appear under attention
-    store.create_issue(
+def test_create_team_spawns_lead(ctx):
+    tc, base = ctx
+    r = tc.post(
+        '/api/v1/teams',
+        json={'name': 'Web Team', 'github_identity': 'mc', 'repos': ['o/a']},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body['team']['id'] == 'web-team'
+    assert body['lead']['role'] == 'lead'
+    # the team's lead exists in its own scope
+    web = base.for_team('web-team')
+    assert web.get_agent('lead') is not None
+
+
+def test_create_team_with_needs_opens_formation_issue(ctx):
+    tc, base = ctx
+    r = tc.post(
+        '/api/v1/teams',
+        json={'name': 'infra', 'github_identity': 'mc', 'needs': 'a backend eng'},
+    )
+    fid = r.json()['formation_issue_id']
+    assert fid is not None
+    infra = base.for_team('infra')
+    assert infra.kv_get(f'formation:{fid}') == 'a backend eng'
+
+
+# -- team-scoped reads -----------------------------------------------------
+def test_dashboard_attention_filter(ctx):
+    tc, base = ctx
+    base.create_issue(
         origin=Origin.GITHUB,
         title='normal',
         author_role='lead',
         state=State.IN_PROGRESS,
     )
-    # an awaiting_gl issue SHOULD appear
-    store.create_issue(
+    base.create_issue(
         origin=Origin.GITHUB,
         title='needs me',
         author_role='lead',
         state=State.AWAITING_GL,
     )
-    r = tc.get('/api/v1/team/dashboard')  # default filter=attention
+    r = tc.get('/api/v1/teams/default/dashboard')
     body = r.json()
-    assert body['filter'] == 'attention'
     assert body['total'] == 1
     assert State.AWAITING_GL.value in body['by_state']
     assert State.IN_PROGRESS.value not in body['by_state']
 
 
-def test_dashboard_all_groups_by_state(client):
-    tc, store = client
-    store.create_issue(
-        origin=Origin.GITHUB, title='a', author_role='lead', state=State.IN_PROGRESS
+def test_dashboard_stuck_surfaces(ctx):
+    tc, base = ctx
+    issue = base.create_issue(
+        origin=Origin.GITHUB, title='stuck', author_role='lead', state=State.ASSIGNED
     )
-    store.create_issue(
-        origin=Origin.GITHUB, title='b', author_role='lead', state=State.NEEDS_TRIAGE
-    )
-    r = tc.get('/api/v1/team/dashboard?filter=all')
-    body = r.json()
-    assert body['total'] == 2
-    assert set(body['by_state'].keys()) == {
-        State.IN_PROGRESS.value,
-        State.NEEDS_TRIAGE.value,
-    }
-
-
-def test_dashboard_surfaces_stuck(client):
-    tc, store = client
-    issue = store.create_issue(
-        origin=Origin.GITHUB,
-        title='stuck one',
-        author_role='lead',
-        state=State.ASSIGNED,
-    )
-    # mark stuck well beyond the default threshold
     old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    store.mark_stuck(issue.id, old, 'lead')
-    r = tc.get('/api/v1/team/dashboard')
-    body = r.json()
-    assert body['total'] == 1
-    assert State.ASSIGNED.value in body['by_state']
+    base.mark_stuck(issue.id, old, 'lead')
+    assert tc.get('/api/v1/teams/default/dashboard').json()['total'] == 1
 
 
-def test_issue_drilldown_links_conversation(client):
-    tc, store = client
-    issue = store.create_issue(
+def test_issue_drilldown_links_conversation(ctx):
+    tc, base = ctx
+    issue = base.create_issue(
         origin=Origin.GITHUB, title='t', author_role='lead', state=State.NEEDS_TRIAGE
     )
-    store.transition(
+    base.transition(
         issue.id,
         to_state=State.ASSIGNED,
         actor_role='lead',
@@ -122,31 +128,32 @@ def test_issue_drilldown_links_conversation(client):
         assignee_role='eng:backend',
         conversation_id='conv-xyz',
     )
-    store.add_comment(
+    base.add_comment(
         issue_id=issue.id,
         author_role='eng:backend',
         provenance=Provenance.AGENT,
-        body='looking into it',
+        body='looking',
         conversation_id='conv-xyz',
     )
-    r = tc.get(f'/api/v1/team/issues/{issue.id}')
-    body = r.json()
+    body = tc.get(f'/api/v1/teams/default/issues/{issue.id}').json()
     assert body['issue']['state'] == State.ASSIGNED.value
-    # event timeline carries the conversation link
-    convo_events = [e for e in body['events'] if e['conversation_id'] == 'conv-xyz']
-    assert convo_events, 'expected an event linked to the conversation'
-    assert any(e['kind'] == EventKind.STATE_CHANGE.value for e in body['events'])
+    assert any(e['conversation_id'] == 'conv-xyz' for e in body['events'])
     assert body['comments'][0]['conversation_id'] == 'conv-xyz'
 
 
-def test_issue_404(client):
-    tc, _ = client
-    assert tc.get('/api/v1/team/issues/nope').status_code == 404
+def test_issue_404(ctx):
+    tc, _ = ctx
+    assert tc.get('/api/v1/teams/default/issues/nope').status_code == 404
 
 
-def test_agents_listing(client):
-    tc, store = client
-    store.upsert_agent(
+def test_unknown_team_404(ctx):
+    tc, _ = ctx
+    assert tc.get('/api/v1/teams/ghost/issues').status_code == 404
+
+
+def test_agents_listing(ctx):
+    tc, base = ctx
+    base.upsert_agent(
         Agent(
             role='lead',
             display_name='Lead',
@@ -155,62 +162,61 @@ def test_agents_listing(client):
             github_identity='mc',
         )
     )
-    r = tc.get('/api/v1/team/agents')
-    roles = [a['role'] for a in r.json()['items']]
+    roles = [a['role'] for a in tc.get('/api/v1/teams/default/agents').json()['items']]
     assert 'lead' in roles
 
 
-def test_events_endpoint(client):
-    tc, store = client
-    issue = store.create_issue(
+def test_events_endpoint(ctx):
+    tc, base = ctx
+    issue = base.create_issue(
         origin=Origin.GITHUB, title='t', author_role='lead', state=State.NEEDS_TRIAGE
     )
-    r = tc.get(f'/api/v1/team/events?issue_id={issue.id}')
-    assert r.status_code == 200
-    kinds = [e['kind'] for e in r.json()['items']]
+    kinds = [
+        e['kind']
+        for e in tc.get(f'/api/v1/teams/default/events?issue_id={issue.id}').json()[
+            'items'
+        ]
+    ]
     assert EventKind.STATE_CHANGE.value in kinds
 
 
-def test_ui_endpoint_serves_board(client):
-    tc, _ = client
-    r = tc.get('/api/v1/team/ui')
+def test_lead_conversation_endpoint(ctx):
+    tc, base = ctx
+    base.set_team_conversation('default', 'conv-lead-1')
+    r = tc.get('/api/v1/teams/default/lead-conversation')
+    assert r.json()['conversation_id'] == 'conv-lead-1'
+
+
+def test_ui_serves_board(ctx):
+    tc, _ = ctx
+    r = tc.get('/api/v1/teams/ui')
     assert r.status_code == 200
     assert 'text/html' in r.headers['content-type']
-    assert 'supervisor cockpit' in r.text
+    assert 'AI Teams' in r.text
 
 
-def test_bootstrap_creates_lead(client):
-    tc, store = client
-    r = tc.post('/api/v1/team/bootstrap', json={'github_identity': 'model-collapse'})
+# -- compat ----------------------------------------------------------------
+def test_compat_health(ctx):
+    tc, _ = ctx
+    r = tc.get('/api/v1/team/health')
     assert r.status_code == 200
-    body = r.json()
-    assert body['lead']['role'] == 'lead'
-    assert body['lead']['github_identity'] == 'model-collapse'
-    assert store.get_agent('lead') is not None
-    assert store.get_agent('grand_leader') is not None
+    assert r.json()['status'] == 'ok'
 
 
-def test_bootstrap_with_needs_opens_formation_issue(client):
-    tc, store = client
-    r = tc.post(
-        '/api/v1/team/bootstrap',
-        json={'github_identity': 'mc', 'needs': 'a backend engineer'},
-    )
-    fid = r.json()['formation_issue_id']
-    assert fid is not None
-    # marker set so the sweep will run form_team
-    assert store.kv_get(f'formation:{fid}') == 'a backend engineer'
-    assert store.get_issue(fid).state == State.INTERNAL
+def test_compat_dashboard_redirects(ctx):
+    tc, _ = ctx
+    r = tc.get('/api/v1/team/dashboard', follow_redirects=False)
+    assert r.status_code in (307, 308)
+    assert '/api/v1/teams/default/dashboard' in r.headers['location']
 
 
-def test_no_issue_state_mutation_endpoints():
-    """The cockpit does not mutate *issue state* (design §9). The only write is
-    the administrative /bootstrap setup endpoint; everything else is read-only."""
-    mutating = {'POST', 'PUT', 'PATCH', 'DELETE'}
-    allowed_write_paths = {'/team/bootstrap'}
-    for route in team_router_mod.router.routes:
-        methods = getattr(route, 'methods', set()) or set()
-        if methods & mutating:
-            assert route.path in allowed_write_paths, (
-                f'unexpected mutating route: {route.path}'
-            )
+# -- read routes don't mutate issue state ---------------------------------
+def test_read_routes_are_not_issue_state_mutations():
+    """Only /teams (create) and /team/bootstrap may be POSTs; the rest of the
+    team API is read-only (design §9). No PUT/PATCH/DELETE anywhere."""
+    for rt in (team_router_mod.router, team_router_mod.compat_router):
+        for route in rt.routes:
+            methods = getattr(route, 'methods', set()) or set()
+            assert not (methods & {'PUT', 'PATCH', 'DELETE'}), route.path
+            if 'POST' in methods:
+                assert route.path in ('/teams', '/team/bootstrap'), route.path

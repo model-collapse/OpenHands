@@ -199,6 +199,45 @@ def test_v1_db_migrates_to_default_team(tmp_path):
         store.close()
 
 
+def test_migrated_agents_have_composite_pk(tmp_path):
+    """Regression: after migration, agents' PK must be (team_id, role) so
+    upsert_agent's ON CONFLICT(team_id, role) works and two teams can each have
+    their own 'lead'. (A naive ALTER-ADD-COLUMN would leave PK=(role) and break
+    upserts + cross-team roles.)"""
+    path = str(tmp_path / 'legacy.db')
+    _make_v1_db(path)
+    store = TeamStore(db_path=path, team_id='default')
+    try:
+        # the pre-existing 'lead' row survived under default
+        assert store.get_agent('lead') is not None
+        # upsert (ON CONFLICT team_id,role) must not raise
+        from openhands.app_server.team.models import Agent
+
+        store.upsert_agent(
+            Agent(
+                role='lead',
+                display_name='Updated',
+                actor_kind=ActorKind.AGENT,
+                agent_kind=AgentKind.OPENHANDS,
+            )
+        )
+        assert store.get_agent('lead').display_name == 'Updated'
+        # a DIFFERENT team can have its own 'lead' (composite PK)
+        other = store.for_team('web')
+        other.upsert_agent(
+            Agent(
+                role='lead',
+                display_name='Web Lead',
+                actor_kind=ActorKind.AGENT,
+                agent_kind=AgentKind.OPENHANDS,
+            )
+        )
+        assert store.get_agent('lead').display_name == 'Updated'
+        assert other.get_agent('lead').display_name == 'Web Lead'
+    finally:
+        store.close()
+
+
 def test_v2_db_reopen_is_idempotent(tmp_path):
     path = str(tmp_path / 'team.db')
     s1 = TeamStore(db_path=path, team_id='default')
