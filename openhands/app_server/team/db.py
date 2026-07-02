@@ -22,9 +22,14 @@ def default_db_path() -> str:
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # check_same_thread=False: the store connection is shared across the async
+    # request handlers (run in a threadpool) and the background loops. Access is
+    # serialized by a lock in TeamStore, and WAL keeps readers/writers from
+    # blocking each other.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys = ON')
+    conn.execute('PRAGMA journal_mode = WAL')
     return conn
 
 

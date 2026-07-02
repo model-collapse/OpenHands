@@ -69,6 +69,23 @@ if _github_poller_enabled:
 
     lifespans.append(_github_poller_lifespan)
 
+# Optional AI team: a supervised multi-agent engineering team built on the
+# internal issue store (see docs/design/ai-team*.md). Opt-in via ENABLE_AI_TEAM.
+# In P4 this owns the store + read-only cockpit; the sweep/reactive loops are
+# added in a later phase.
+_ai_team_enabled = os.getenv('ENABLE_AI_TEAM', 'false').lower() in ('true', '1')
+if _ai_team_enabled:
+    from openhands.app_server.team.service import get_team_service
+
+    _team_service = get_team_service()
+
+    @contextlib.asynccontextmanager
+    async def _team_lifespan(app):
+        async with _team_service:
+            yield
+
+    lifespans.append(_team_lifespan)
+
 
 app = FastAPI(
     title='OpenHands',
@@ -97,6 +114,11 @@ if _github_poller_enabled:
 
     # Mounted under /api/v1 so it shares host/port with the rest of the app.
     app.include_router(github_poller_router, prefix='/api/v1')
+
+if _ai_team_enabled:
+    from openhands.app_server.team.router import router as team_router
+
+    app.include_router(team_router, prefix='/api/v1')
 
 # Middleware and static file setup (merged from listen.py)
 if os.getenv('SERVE_FRONTEND', 'true').lower() == 'true':

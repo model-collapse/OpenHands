@@ -12,9 +12,13 @@ appending an event — so no state change can exist without an audit record.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import Any, TypeVar
 
 from openhands.app_server.team import db as _db
 from openhands.app_server.team.events import record_event
@@ -33,6 +37,21 @@ from openhands.app_server.team.models import (
     State,
 )
 
+_F = TypeVar('_F', bound=Callable[..., Any])
+
+
+def _locked(method: _F) -> _F:
+    """Serialize a store method under the instance lock. The single SQLite
+    connection is shared across request-handler threads and background loops
+    (see ``db.connect``), so all access is serialized here."""
+
+    @functools.wraps(method)
+    def wrapper(self: 'TeamStore', *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -45,13 +64,16 @@ def _new_id() -> str:
 class TeamStore:
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = db_path or _db.default_db_path()
+        self._lock = threading.RLock()
         self._conn = _db.connect(self.db_path)
         _db.init_db(self._conn)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- agents ------------------------------------------------------------
+    @_locked
     def upsert_agent(self, agent: Agent) -> Agent:
         created = agent.created_at or _now()
         with self._conn:  # transaction
@@ -102,12 +124,14 @@ class TeamStore:
         agent.created_at = created
         return agent
 
+    @_locked
     def get_agent(self, role: str) -> Agent | None:
         row = self._conn.execute(
             'SELECT * FROM agents WHERE role=?', (role,)
         ).fetchone()
         return _row_to_agent(row) if row else None
 
+    @_locked
     def list_agents(self, enabled_only: bool = False) -> list[Agent]:
         q = 'SELECT * FROM agents'
         if enabled_only:
@@ -115,6 +139,7 @@ class TeamStore:
         return [_row_to_agent(r) for r in self._conn.execute(q + ' ORDER BY role')]
 
     # -- issues ------------------------------------------------------------
+    @_locked
     def create_issue(
         self,
         *,
@@ -160,18 +185,21 @@ class TeamStore:
             )
         return self.get_issue(issue_id)  # type: ignore[return-value]
 
+    @_locked
     def get_issue(self, issue_id: str) -> Issue | None:
         row = self._conn.execute(
             'SELECT * FROM issues WHERE id=?', (issue_id,)
         ).fetchone()
         return _row_to_issue(row) if row else None
 
+    @_locked
     def get_issue_by_github_ref(self, github_ref: str) -> Issue | None:
         row = self._conn.execute(
             'SELECT * FROM issues WHERE github_ref=?', (github_ref,)
         ).fetchone()
         return _row_to_issue(row) if row else None
 
+    @_locked
     def list_issues(
         self,
         *,
@@ -192,6 +220,7 @@ class TeamStore:
         q += ' ORDER BY updated_at DESC'
         return [_row_to_issue(r) for r in self._conn.execute(q, params)]
 
+    @_locked
     def transition(
         self,
         issue_id: str,
@@ -249,6 +278,7 @@ class TeamStore:
                 (to_state.value, now, issue_id),
             )
 
+    @_locked
     def set_priority(
         self, issue_id: str, priority: Priority, actor_role: str, reason: str
     ) -> None:
@@ -267,6 +297,7 @@ class TeamStore:
                 detail={'priority': priority.value, 'reason': reason},
             )
 
+    @_locked
     def set_risk(
         self, issue_id: str, risk: Risk | None, actor_role: str, reason: str
     ) -> None:
@@ -285,6 +316,7 @@ class TeamStore:
                 detail={'risk': risk.value if risk else None, 'reason': reason},
             )
 
+    @_locked
     def bump_round(self, issue_id: str, actor_role: str) -> int:
         now = _now()
         with self._conn:
@@ -307,6 +339,7 @@ class TeamStore:
             )
         return count
 
+    @_locked
     def mark_stuck(self, issue_id: str, since: str | None, actor_role: str) -> None:
         now = _now()
         with self._conn:
@@ -324,6 +357,7 @@ class TeamStore:
             )
 
     # -- comments ----------------------------------------------------------
+    @_locked
     def add_comment(
         self,
         *,
@@ -375,6 +409,7 @@ class TeamStore:
             created_at=now,
         )
 
+    @_locked
     def list_comments(self, issue_id: str) -> list[Comment]:
         return [
             _row_to_comment(r)
@@ -385,6 +420,7 @@ class TeamStore:
         ]
 
     # -- events (read) -----------------------------------------------------
+    @_locked
     def list_events(self, issue_id: str | None = None, limit: int = 200) -> list[Event]:
         if issue_id is not None:
             rows = self._conn.execute(
@@ -397,6 +433,7 @@ class TeamStore:
             )
         return [_row_to_event(r) for r in rows]
 
+    @_locked
     def record_nonstate_event(
         self,
         *,
@@ -419,6 +456,7 @@ class TeamStore:
             )
 
     # -- inbox -------------------------------------------------------------
+    @_locked
     def inbox_add(self, role: str, issue_id: str, reason: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -427,6 +465,7 @@ class TeamStore:
                 (role, issue_id, reason, _now()),
             )
 
+    @_locked
     def inbox_list(self, role: str) -> list[tuple[str, str]]:
         return [
             (r['issue_id'], r['reason'])
@@ -436,6 +475,7 @@ class TeamStore:
             )
         ]
 
+    @_locked
     def inbox_clear(self, role: str, issue_id: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -443,6 +483,7 @@ class TeamStore:
             )
 
     # -- sync_map ----------------------------------------------------------
+    @_locked
     def map_sync(self, internal_id: str, github_ref: str, kind: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -452,16 +493,19 @@ class TeamStore:
             )
 
     # -- kv (sync cursors, small state) -----------------------------------
+    @_locked
     def kv_get(self, key: str, default: str | None = None) -> str | None:
         row = self._conn.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
         return row['value'] if row else default
 
+    @_locked
     def kv_set(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
                 'INSERT OR REPLACE INTO kv(key, value) VALUES (?,?)', (key, value)
             )
 
+    @_locked
     def is_synced(self, github_ref: str, kind: str) -> bool:
         return (
             self._conn.execute(
