@@ -11,9 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import httpx
+
 from openhands.app_server.team.config import TeamConfig
 from openhands.app_server.team.github import GitHubClient
-from openhands.app_server.team.lead import LeadBrain
+from openhands.app_server.team.lead import LeadBrain, _default_think
+from openhands.app_server.team.reactive import ReactiveRouter
+from openhands.app_server.team.spawn import AgentSpawner
 from openhands.app_server.team.store import TeamStore
 from openhands.app_server.team.sweep import LeadSweep
 from openhands.app_server.team.sync import SyncBridge
@@ -26,6 +30,7 @@ class TeamService:
         self.config = config or TeamConfig.from_env()
         self._store: TeamStore | None = None
         self._sweep_task: asyncio.Task | None = None
+        self._reactive_task: asyncio.Task | None = None
 
     @property
     def store(self) -> TeamStore:
@@ -68,26 +73,72 @@ class TeamService:
                 logger.error('AI team sweep pass failed: %s', e)
             await asyncio.sleep(self.config.sweep_interval)
 
+    def _build_reactive(self) -> ReactiveRouter:
+        cfg = self.config
+        spawner = AgentSpawner(cfg.self_url, self.store)
+        # The assignee's evaluation is (for now) a lead-model reasoning call over
+        # the issue; grounding it in a full member-conversation clone/inspect is
+        # a P8 refinement. It still returns the structured accept/concern verdict
+        # the router expects.
+        think = _default_think(cfg.lead_model)
+
+        async def assignee_eval(prompt: str) -> str:
+            return think(prompt)
+
+        async def status_fn(conversation_id: str) -> str | None:
+            url = f'{cfg.self_url}/api/v1/app-conversations?ids={conversation_id}'
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(url, timeout=15.0)
+                    r.raise_for_status()
+                    items = r.json().get('items', [])
+                    if items:
+                        return items[0].get('execution_status')
+            except Exception as e:  # noqa: BLE001
+                logger.debug('status_fn(%s) failed: %s', conversation_id, e)
+            return None
+
+        return ReactiveRouter(
+            self.store,
+            spawner,
+            engineer_status_fn=status_fn,
+            assignee_eval_fn=assignee_eval,
+        )
+
+    async def _reactive_loop(self) -> None:
+        router = self._build_reactive()
+        logger.info(
+            'AI team reactive router started (interval=%ss)',
+            self.config.sync_interval,
+        )
+        while True:
+            try:
+                await router.run_once()
+            except Exception as e:  # noqa: BLE001
+                logger.error('AI team reactive pass failed: %s', e)
+            await asyncio.sleep(self.config.sync_interval)
+
     # -- lifespan ----------------------------------------------------------
     async def __aenter__(self) -> 'TeamService':
         # Touch the store to create/migrate the schema at startup.
         _ = self.store
         logger.info('AI team service started (db=%s)', self.store.db_path)
-        # Only run the lead sweep once a lead has been bootstrapped; otherwise
-        # there is no one to triage with. Starting the task is cheap — it no-ops
-        # over an empty issue set until repos/lead exist.
+        # Both loops are cheap when idle — they no-op over an empty issue set
+        # until a lead + repos are configured.
         self._sweep_task = asyncio.create_task(self._sweep_loop())
-        # NOTE: the reactive router (P6) will be started here too.
+        self._reactive_task = asyncio.create_task(self._reactive_loop())
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
-        if self._sweep_task is not None:
-            self._sweep_task.cancel()
-            try:
-                await self._sweep_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            self._sweep_task = None
+        for task in (self._sweep_task, self._reactive_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        self._sweep_task = None
+        self._reactive_task = None
         if self._store is not None:
             self._store.close()
             self._store = None

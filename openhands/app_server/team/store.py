@@ -482,6 +482,16 @@ class TeamStore:
                 'DELETE FROM inbox WHERE role=? AND issue_id=?', (role, issue_id)
             )
 
+    @_locked
+    def latest_spawn_conversation(self, issue_id: str) -> str | None:
+        """The conversation id of the most recent spawn event for an issue."""
+        row = self._conn.execute(
+            "SELECT conversation_id FROM events WHERE issue_id=? AND kind='spawn' "
+            'AND conversation_id IS NOT NULL ORDER BY id DESC LIMIT 1',
+            (issue_id,),
+        ).fetchone()
+        return row['conversation_id'] if row else None
+
     # -- sync_map ----------------------------------------------------------
     @_locked
     def map_sync(self, internal_id: str, github_ref: str, kind: str) -> None:
