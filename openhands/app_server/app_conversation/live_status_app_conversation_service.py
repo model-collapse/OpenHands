@@ -432,6 +432,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     selected_repository=request.selected_repository,
                     plugins=request.plugins,
                     api_secrets=request.secrets,
+                    agent_settings_override=request.agent_settings_override,
                 )
             )
 
@@ -502,9 +503,15 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 # can resolve a brand label ("Claude Code", "Codex", …) via
                 # the SDK registry without keeping a per-conversation column.
                 # Surfaced to the UI as the projected ``acp_server`` field.
-                acp_user = await self.user_context.get_user_info()
-                if isinstance(acp_user.agent_settings, ACPAgentSettings):
-                    tags[ACP_SERVER_TAG_KEY] = acp_user.agent_settings.acp_server
+                # Prefer the built request's agent (honors any per-conversation
+                # override); fall back to the user's saved settings.
+                acp_server = getattr(request_agent, 'acp_server', None)
+                if not acp_server:
+                    acp_user = await self.user_context.get_user_info()
+                    if isinstance(acp_user.agent_settings, ACPAgentSettings):
+                        acp_server = acp_user.agent_settings.acp_server
+                if acp_server:
+                    tags[ACP_SERVER_TAG_KEY] = acp_server
             else:
                 llm_model = request_agent.llm.model
                 agent_kind = 'openhands'
@@ -1534,6 +1541,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         selected_repository: str | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
+        agent_settings_override: dict[str, Any] | None = None,
     ) -> StartConversationRequest:
         """Build a complete StartConversationRequest for a user.
 
@@ -1565,6 +1573,15 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         """
         user = await self.user_context.get_user_info()
 
+        # Apply a per-conversation agent-settings override, if supplied. This
+        # merges on top of the user's saved settings for THIS conversation only
+        # (not persisted) and takes precedence, so downstream reads of
+        # ``user.agent_settings`` — including the ACP-vs-OpenHands branch below —
+        # see the overridden config. Enables heterogeneous members (e.g. an
+        # OpenHands and an ACP member) under one user.
+        if agent_settings_override:
+            user = self._apply_agent_settings_override(user, agent_settings_override)
+
         # Route ACP agent settings to the ACP-specific builder
         if isinstance(user.agent_settings, ACPAgentSettings):
             acp_request = await self._build_acp_start_conversation_request(
@@ -1577,6 +1594,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 selected_repository=selected_repository,
                 plugins=plugins,
                 api_secrets=api_secrets,
+                agent_settings_override=agent_settings_override,
             )
             if remote_workspace:
                 acp_request = await self._load_skills_onto_request(
@@ -1812,6 +1830,23 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             return request
 
     @staticmethod
+    def _apply_agent_settings_override(
+        user: UserInfo, override: dict[str, Any]
+    ) -> UserInfo:
+        """Return a copy of ``user`` with a per-conversation agent-settings
+        override merged onto its saved agent settings.
+
+        Uses the SDK's ``apply_agent_settings_diff`` so ``agent_kind`` changes
+        (openhands↔acp) narrow to the correct variant rather than deep-merging
+        across the union boundary. The override is never persisted — it applies
+        to this conversation only.
+        """
+        from openhands.sdk.settings import apply_agent_settings_diff
+
+        merged = apply_agent_settings_diff(user.agent_settings, override)
+        return user.model_copy(update={'agent_settings': merged})
+
+    @staticmethod
     def _resolve_acp_workspace_dir(project_dir: str, sandbox: SandboxInfo) -> str:
         """Return an absolute workspace dir for an ACP session.
 
@@ -1844,6 +1879,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         selected_repository: str | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
+        agent_settings_override: dict[str, Any] | None = None,
     ) -> StartConversationRequest:
         """Build a StartConversationRequest for ACP agent conversations.
 
@@ -1869,6 +1905,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             api_secrets: Optional secrets passed directly via the API.
         """
         user = await self.user_context.get_user_info()
+        # Re-apply the per-conversation override here too: this builder re-fetches
+        # the user, so without this the override set in the outer builder is lost
+        # (the ACP branch is entered precisely because of the override).
+        if agent_settings_override:
+            user = self._apply_agent_settings_override(user, agent_settings_override)
 
         project_dir = get_project_dir(working_dir, selected_repository)
         # ACP servers (e.g. claude-agent-acp) require an ABSOLUTE session cwd and

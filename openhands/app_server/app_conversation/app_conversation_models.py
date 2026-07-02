@@ -217,6 +217,17 @@ class AppConversationStartRequest(OpenHandsModel):
     processors: list[EventCallbackProcessor] | None = Field(default=None)
     llm_model: str | None = None
 
+    # Per-conversation agent-settings override. When provided, this partial
+    # agent-settings dict is applied on top of the user's saved agent settings
+    # for THIS conversation only (never persisted), taking precedence. It lets a
+    # caller pick the agent kind/config per conversation — e.g. spawn one
+    # OpenHands member and one ACP (Claude Code) member concurrently under a
+    # single user — which is otherwise impossible because agent kind is sourced
+    # from the user's settings. Shape matches ``agent_settings`` (accepts
+    # ``agent_kind: 'openhands'|'acp'``, ``acp_server``, ``acp_model``, ``llm``,
+    # ...); validated via the SDK's ``validate_agent_settings``.
+    agent_settings_override: dict[str, Any] | None = None
+
     # Git parameters
     selected_repository: str | None = None
     selected_branch: str | None = None
