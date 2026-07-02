@@ -81,7 +81,13 @@ class LeadSweep:
                 logger.info('sweep: hit max_spawns budget (%d)', self.max_spawns)
                 break
             try:
-                if issue.state in _TRIAGE_STATES:
+                # A formation issue (internal + a formation marker) is handled
+                # by the lead forming its team, not by normal triage (§2b).
+                needs = self.store.kv_get(f'formation:{issue.id}')
+                if needs and issue.state not in (State.DONE, State.HALTED):
+                    if await self._form_team(issue, needs):
+                        actions += 1
+                elif issue.state in _TRIAGE_STATES:
                     if await self._triage(issue):
                         actions += 1
                 elif issue.state == State.DISCUSSING:
@@ -92,6 +98,45 @@ class LeadSweep:
 
         self._escalate_stuck()
         return actions
+
+    async def _form_team(self, issue, needs: str) -> bool:
+        """The lead forms its team from the grand leader's stated needs (§2b).
+
+        The lead decides the roster; we register the members (skipping roles that
+        already exist) and close the formation issue. The marker is cleared so it
+        runs once.
+        """
+        from openhands.app_server.team.bootstrap import register_member
+
+        result = self.lead.form_team(needs)
+        existing = {a.role for a in self.store.list_agents()}
+        added = []
+        for spec in result['members']:
+            if spec['role'] in existing:
+                continue
+            register_member(self.store, spec)
+            added.append(spec['role'])
+        self.store.kv_set(f'formation:{issue.id}', '')  # clear marker (run once)
+        self.store.add_comment(
+            issue_id=issue.id,
+            author_role=ROLE_LEAD,
+            provenance=_agent_provenance(),
+            body=f'Formed team: {", ".join(added) or "(no new members)"}. '
+            f'{result["rationale"]}',
+        )
+        self.store.transition(
+            issue.id,
+            to_state=State.DONE,
+            actor_role=ROLE_LEAD,
+            reason=f'team formed: {added}',
+        )
+        await self._publish(
+            issue.id,
+            f'**[Team Lead]** Formed team: {", ".join(added) or "(none)"}. '
+            f'{result["rationale"]}',
+        )
+        logger.info('sweep: lead formed team %s', added)
+        return True
 
     async def _triage(self, issue) -> bool:
         decision = self.lead.triage(issue)

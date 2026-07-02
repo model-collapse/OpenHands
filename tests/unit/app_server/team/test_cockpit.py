@@ -160,9 +160,14 @@ def test_agents_listing(client):
     assert 'lead' in roles
 
 
-def test_no_mutation_endpoints():
-    """The cockpit is read-only: no POST/PUT/PATCH/DELETE routes (design §9)."""
+def test_no_issue_state_mutation_endpoints():
+    """The cockpit does not mutate *issue state* (design §9). The only write is
+    the administrative /bootstrap setup endpoint; everything else is read-only."""
     mutating = {'POST', 'PUT', 'PATCH', 'DELETE'}
+    allowed_write_paths = {'/team/bootstrap'}
     for route in team_router_mod.router.routes:
         methods = getattr(route, 'methods', set()) or set()
-        assert not (methods & mutating), f'unexpected mutating route: {route.path}'
+        if methods & mutating:
+            assert route.path in allowed_write_paths, (
+                f'unexpected mutating route: {route.path}'
+            )

@@ -93,6 +93,42 @@ class LeadBrain:
             )
         return out
 
+    # -- team formation (§2b) ---------------------------------------------
+    def form_team(self, needs: str) -> dict[str, Any]:
+        """Given the grand leader's stated needs, return a validated roster to
+        add: {members: [ {role, agent_kind, acp_server?, llm_model?, skills?,
+        display_name?} ], rationale}.
+
+        The lead decides *who to hire*; the caller (service/sweep) writes the
+        rows via ``register_members``. Malformed specs are dropped, not
+        registered. Members whose role already exists are skipped by the caller.
+        """
+        existing = self._members()
+        prompt = _env.get_template('formation.j2').render(
+            needs=needs, existing=existing
+        )
+        raw = self._think(prompt)
+        data = _parse_json(raw)
+        members = data.get('members')
+        if not isinstance(members, list):
+            raise ValueError('formation output missing a "members" list')
+
+        valid: list[dict[str, Any]] = []
+        for m in members:
+            if not isinstance(m, dict) or not m.get('role'):
+                continue
+            kind = m.get('agent_kind', 'openhands')
+            if kind not in ('openhands', 'acp'):
+                continue
+            spec: dict[str, Any] = {'role': m['role'], 'agent_kind': kind}
+            if kind == 'acp':
+                spec['acp_server'] = m.get('acp_server') or 'claude-code'
+            for opt in ('llm_model', 'skills', 'display_name'):
+                if m.get(opt):
+                    spec[opt] = m[opt]
+            valid.append(spec)
+        return {'members': valid, 'rationale': data.get('rationale', '')}
+
     # -- triage ------------------------------------------------------------
     def triage(self, issue: Issue) -> dict[str, Any]:
         """Return a validated triage decision:

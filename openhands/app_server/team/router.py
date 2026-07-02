@@ -1,8 +1,10 @@
-"""Read-only cockpit for the AI team (design §10).
+"""Cockpit for the AI team (design §10).
 
-Mounted under ``/api/v1/team``. The supervisor observes and drills into
-reasoning; there are NO state-mutation endpoints (the human acts via GitHub —
-design §9). The centerpiece is ``/issues/{id}``: an event timeline where every
+Mounted under ``/api/v1/team``. Read-mostly: the supervisor observes and drills
+into reasoning, and does NOT edit *issue state* here (issue state changes flow
+through the lead / GitHub — design §9). The one write is administrative *setup*
+— ``POST /bootstrap`` creates the team lead (and optionally opens a formation
+issue). The centerpiece read is ``/issues/{id}``: an event timeline where every
 event deep-links to the conversation that produced it.
 """
 
@@ -11,10 +13,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from openhands.app_server.team.config import TeamConfig
-from openhands.app_server.team.models import TERMINAL_STATES, State
+from openhands.app_server.team.models import TERMINAL_STATES, Origin, State
 from openhands.app_server.team.service import get_team_service
 
 router = APIRouter(prefix='/team', tags=['AI Team'])
@@ -176,4 +178,63 @@ async def list_events(issue_id: str | None = None, limit: int = 200) -> dict:
             }
             for e in events
         ]
+    }
+
+
+@router.post('/bootstrap')
+async def bootstrap(request: Request) -> dict:
+    """Create the team lead (administrative setup — see module docstring).
+
+    Body (all optional):
+      { "github_identity": "<login>",   # else uses TEAM_GITHUB_IDENTITY
+        "needs": "<what the team should cover>" }
+
+    Creates the grand_leader + lead. If ``needs`` is given, opens an ``internal``
+    formation issue so the lead forms its team on the next sweep (design §2b).
+    Idempotent: re-calling returns the existing lead.
+    """
+    from openhands.app_server.team.bootstrap import bootstrap_team
+    from openhands.app_server.team.models import ROLE_LEAD
+
+    svc = get_team_service()
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        pass
+    github_identity = body.get('github_identity') or svc.config.github_identity
+    if not github_identity:
+        raise HTTPException(
+            400, 'github_identity is required (body or TEAM_GITHUB_IDENTITY)'
+        )
+
+    lead = bootstrap_team(
+        svc.store,
+        github_identity=github_identity,
+        lead_model=svc.config.lead_model,
+    )
+
+    formation_issue_id = None
+    needs = (body.get('needs') or '').strip()
+    if needs:
+        issue = svc.store.create_issue(
+            origin=Origin.INTERNAL,
+            title='Team formation',
+            body=needs,
+            author_role='grand_leader',
+            state=State.INTERNAL,
+        )
+        # Mark it a formation issue so the sweep runs form_team (not triage) on
+        # it. kv keyed by issue id keeps the marker out of the issue schema.
+        svc.store.kv_set(f'formation:{issue.id}', needs)
+        formation_issue_id = issue.id
+
+    return {
+        'lead': {
+            'role': lead.role,
+            'github_identity': lead.github_identity,
+            'agent_kind': lead.agent_kind.value if lead.agent_kind else None,
+        },
+        'lead_exists': lead.role == ROLE_LEAD,
+        'formation_issue_id': formation_issue_id,
     }
