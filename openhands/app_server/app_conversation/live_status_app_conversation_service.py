@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import zipfile
 from collections import defaultdict
 from collections.abc import Mapping
@@ -1810,6 +1811,28 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             _logger.warning(f'Failed to load skills: {e}', exc_info=True)
             return request
 
+    @staticmethod
+    def _resolve_acp_workspace_dir(project_dir: str, sandbox: SandboxInfo) -> str:
+        """Return an absolute workspace dir for an ACP session.
+
+        Absolute paths are returned unchanged. A relative path (the process/
+        local sandbox advertises ``working_dir='.'``) is anchored to the process
+        sandbox's per-sandbox directory ``{base}/{sandbox_id}`` — where that
+        agent-server actually runs — so the ACP server receives a valid absolute
+        cwd. ``PROCESS_SANDBOX_BASE_WORKING_DIR`` overrides the base to match a
+        non-default ``ProcessSandboxServiceInjector.base_working_dir``.
+        """
+        if os.path.isabs(project_dir):
+            return project_dir
+        base = os.environ.get(
+            'PROCESS_SANDBOX_BASE_WORKING_DIR',
+            os.path.join(tempfile.gettempdir(), 'openhands-sandboxes'),
+        )
+        sandbox_root = os.path.join(base, sandbox.id)
+        # ``project_dir`` may be '.' or 'repo-name'; join and normalize.
+        resolved = os.path.normpath(os.path.join(sandbox_root, project_dir))
+        return resolved
+
     async def _build_acp_start_conversation_request(
         self,
         sandbox: SandboxInfo,
@@ -1848,6 +1871,17 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         user = await self.user_context.get_user_info()
 
         project_dir = get_project_dir(working_dir, selected_repository)
+        # ACP servers (e.g. claude-agent-acp) require an ABSOLUTE session cwd and
+        # reject a relative one ("`cwd` must be an absolute path, but received:
+        # .."). The OpenHands agent tolerates a relative dir because it runs
+        # relative to the agent-server's own cwd, so the process/local sandbox
+        # spec advertises ``working_dir='.'``. For that runtime the agent-server
+        # runs inside ``{process base}/{sandbox_id}`` (see
+        # ProcessSandboxService), so anchor a relative project dir there before
+        # handing it to the ACP session. Absolute paths (docker/remote) pass
+        # through untouched. Proper fix is upstream in the SDK's ACP agent
+        # (abspath the cwd); tracked separately.
+        project_dir = self._resolve_acp_workspace_dir(project_dir, sandbox)
         workspace = LocalWorkspace(working_dir=project_dir)
 
         # --- secrets --------------------------------------------------------
