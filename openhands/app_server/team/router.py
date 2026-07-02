@@ -117,6 +117,11 @@ async def create_team(request: Request) -> dict:
         store, github_identity=github_identity, lead_model=svc.config.lead_model
     )
 
+    # Open the persistent grand-leader <-> lead conversation (design §9). The
+    # UI links to it; the reactive loop ingests the human's turns (V4). Best
+    # effort — a failure here doesn't block team creation.
+    conversation_id = await _open_lead_conversation(svc, store, team_id, name)
+
     formation_issue_id = None
     needs = (body.get('needs') or '').strip()
     if needs:
@@ -133,8 +138,48 @@ async def create_team(request: Request) -> dict:
     return {
         'team': {**svc.base_store.get_team(team_id)},  # type: ignore[dict-item]
         'lead': {'role': lead.role, 'github_identity': lead.github_identity},
+        'lead_conversation_id': conversation_id,
         'formation_issue_id': formation_issue_id,
     }
+
+
+async def _open_lead_conversation(svc, store, team_id: str, name: str) -> str | None:
+    """Start the lead's conversation and persist its id on the team row."""
+    import httpx
+
+    existing = svc.base_store.get_team(team_id)
+    if existing and existing.get('lead_conversation_id'):
+        return existing['lead_conversation_id']
+    intro = (
+        f"You are the Team Lead of the '{name}' AI engineering team. This is your "
+        'conversation with the grand leader (the human supervisor). They will '
+        'steer you here — forming the team, prioritizing, approving high-risk '
+        'work, or halting. Introduce yourself briefly and ask what the team '
+        'should focus on.'
+    )
+    payload = {
+        'initial_message': {
+            'role': 'user',
+            'content': [{'type': 'text', 'text': intro}],
+            'run': True,
+        },
+        'llm_model': svc.config.lead_model,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f'{svc.config.self_url}/api/v1/app-conversations',
+                json=payload,
+                timeout=60.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            cid = data.get('app_conversation_id') or data.get('id')
+    except Exception:  # noqa: BLE001
+        return None
+    if cid:
+        svc.base_store.set_team_conversation(team_id, cid)
+    return cid
 
 
 # =====================================================================

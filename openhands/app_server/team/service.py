@@ -16,6 +16,7 @@ import logging
 
 import httpx
 
+from openhands.app_server.team.channel import LeadConversationChannel
 from openhands.app_server.team.config import TeamConfig
 from openhands.app_server.team.github import GitHubClient
 from openhands.app_server.team.lead import LeadBrain, _default_think
@@ -109,6 +110,43 @@ class TeamService:
             assignee_eval_fn=assignee_eval,
         )
 
+    def _build_channel(self, store: TeamStore) -> LeadConversationChannel:
+        cfg = self.config
+        lead = LeadBrain(
+            store, model=cfg.lead_model, round_cap=cfg.negotiation_round_cap
+        )
+
+        async def fetch_messages(
+            conversation_id: str, after_id: int
+        ) -> list[tuple[int, str]]:
+            """Read user-authored message turns after ``after_id`` from the lead
+            conversation via the app-server events API."""
+            url = (
+                f'{cfg.self_url}/api/v1/conversation/{conversation_id}'
+                f'/events/search?kind__eq=MessageEvent&limit=100'
+            )
+            out: list[tuple[int, str]] = []
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(url, timeout=15.0)
+                    r.raise_for_status()
+                    for i, ev in enumerate(r.json().get('items', [])):
+                        # user turns only; the events API returns them in order,
+                        # use the index as a monotonic id (the SDK event has no
+                        # stable int id here).
+                        if ev.get('source') != 'user':
+                            continue
+                        if i <= after_id:
+                            continue
+                        text = _message_text(ev)
+                        if text:
+                            out.append((i, text))
+            except Exception as e:  # noqa: BLE001
+                logger.debug('fetch_messages(%s) failed: %s', conversation_id, e)
+            return out
+
+        return LeadConversationChannel(store, lead, fetch_messages=fetch_messages)
+
     def _build_import_bridge(self, store: TeamStore, team: dict) -> SyncBridge | None:
         cfg = self.config
         identity = self._team_identity(team)
@@ -158,6 +196,10 @@ class TeamService:
             try:
                 for team in self._enabled_teams():
                     store = self.store_for(team['id'])
+                    # Grand-leader <-> lead conversation channel (design §9).
+                    convo_id = team.get('lead_conversation_id')
+                    if convo_id:
+                        await self._build_channel(store).process(convo_id)
                     import_bridge = self._build_import_bridge(store, team)
                     if import_bridge is not None:
                         for repo in self._team_repos(team):
@@ -190,6 +232,22 @@ class TeamService:
             self._base_store.close()
             self._base_store = None
         logger.info('AI team service stopped')
+
+
+def _message_text(event: dict) -> str:
+    """Extract plain text from a MessageEvent's content (list of parts or str)."""
+    content = event.get('content') or event.get('message') or ''
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get('type') == 'text':
+                parts.append(p.get('text', ''))
+            elif isinstance(p, str):
+                parts.append(p)
+        return ' '.join(parts).strip()
+    return ''
 
 
 _service: TeamService | None = None
