@@ -1,5 +1,5 @@
 import React from "react";
-import { PrefetchPageLinks } from "react-router";
+import { Link, PrefetchPageLinks } from "react-router";
 import { HomeHeader } from "#/components/features/home/home-header/home-header";
 import { RepoConnector } from "#/components/features/home/repo-connector";
 import { TaskSuggestions } from "#/components/features/home/tasks/task-suggestions";
@@ -28,6 +28,20 @@ function HomeScreen() {
       className="px-0 pt-4 bg-transparent h-full flex flex-col pt-[35px] overflow-y-auto rounded-xl lg:px-[42px] lg:pt-[42px] custom-scrollbar-always"
     >
       <HomeHeader />
+
+      {/* eslint-disable i18next/no-literal-string */}
+      <div className="pt-3 flex justify-center">
+        <div className="flex px-6 lg:px-0 lg:max-w-[703px] lg:min-w-[703px] w-full">
+          <Link
+            to="/teams"
+            data-testid="home-teams-entry"
+            className="text-sm text-neutral-300 hover:text-white underline underline-offset-2"
+          >
+            AI Teams →
+          </Link>
+        </div>
+      </div>
+      {/* eslint-enable i18next/no-literal-string */}
 
       <div className="pt-[25px] flex justify-center">
         <div

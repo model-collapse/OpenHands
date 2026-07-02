@@ -40,6 +40,8 @@ export default [
       route("admin-dashboard", "routes/admin-dashboard.tsx"),
     ]),
     route("conversations/:conversationId", "routes/conversation.tsx"),
+    route("teams", "routes/teams.tsx"),
+    route("teams/:teamId", "routes/team-detail.tsx"),
     route("oauth/device/verify", "routes/device-verify.tsx"),
   ]),
   // Shared routes that don't require authentication
