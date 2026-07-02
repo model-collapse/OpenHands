@@ -21,6 +21,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from openhands.app_server.team.github import GitHubClient
+from openhands.app_server.team.influence import GrandLeaderInfluence
 from openhands.app_server.team.labels import (
     STATE_LABEL,
     labels_to_state,
@@ -65,11 +66,15 @@ class SyncBridge:
         *,
         lead_identity: str,
         first_run_lookback_seconds: int = 600,
+        influence: GrandLeaderInfluence | None = None,
     ) -> None:
         self.store = store
         self.gh = gh
         self.lead_identity = lead_identity
         self.first_run_lookback = first_run_lookback_seconds
+        # Applies grand-leader influence (halt/approve/guidance) to each imported
+        # supervisor comment. Defaults to a store-backed handler (P7).
+        self.influence = influence or GrandLeaderInfluence(store)
 
     def _cursor_key(self, repo: str, stream: str) -> str:
         return f'sync_cursor:{repo}:{stream}'
@@ -145,17 +150,21 @@ class SyncBridge:
                 continue
             # External human comments are influence directed at the lead; we
             # attribute them to the grand_leader role (the human supervisor).
+            body = cm.get('body') or ''
             self.store.add_comment(
                 issue_id=issue.id,
                 author_role=ROLE_GRAND_LEADER,
                 provenance=Provenance.SYNCED_IN,
-                body=cm.get('body') or '',
+                body=body,
                 github_comment_id=gh_comment_id,
             )
             # Dedup key for comments is the github comment id. sync_map PK is
             # (internal_id, kind), so use the comment id for both columns to
             # keep each comment a distinct row that is_synced(id,'comment') hits.
             self.store.map_sync(gh_comment_id, gh_comment_id, 'comment')
+            # Apply the comment's grand-leader influence (halt / approve /
+            # guidance-to-lead). Import records the comment; influence acts on it.
+            self.influence.apply(issue.id, body)
         self._set_cursor(repo, 'comments', newest)
 
     # -- label-change detection -------------------------------------------

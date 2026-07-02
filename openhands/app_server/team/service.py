@@ -105,14 +105,33 @@ class TeamService:
             assignee_eval_fn=assignee_eval,
         )
 
+    def _build_import_bridge(self) -> SyncBridge | None:
+        cfg = self.config
+        if not (cfg.github_token and cfg.github_identity):
+            return None
+        return SyncBridge(
+            self.store,
+            GitHubClient(cfg.github_token),
+            lead_identity=cfg.github_identity,
+            first_run_lookback_seconds=cfg.first_run_lookback,
+        )
+
     async def _reactive_loop(self) -> None:
         router = self._build_reactive()
+        import_bridge = self._build_import_bridge()
         logger.info(
-            'AI team reactive router started (interval=%ss)',
+            'AI team reactive router started (interval=%ss, repos=%s)',
             self.config.sync_interval,
+            self.config.repos or '(none)',
         )
         while True:
             try:
+                # Inbound: import external issues + grand-leader comments (which
+                # apply their influence on import). No repos or no token -> skip.
+                if import_bridge is not None:
+                    for repo in self.config.repos:
+                        await import_bridge.import_repo(repo)
+                # Then advance state (assignee eval, execute, poll, ...).
                 await router.run_once()
             except Exception as e:  # noqa: BLE001
                 logger.error('AI team reactive pass failed: %s', e)

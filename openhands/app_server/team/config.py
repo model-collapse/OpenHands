@@ -21,6 +21,7 @@ class TeamConfig:
     self_url: str
     github_identity: str | None
     github_token: str
+    repos: list[str]
     lead_model: str
     default_eng_model: str
     sync_interval: int
@@ -41,6 +42,9 @@ class TeamConfig:
             github_token=(
                 os.getenv('TEAM_GITHUB_TOKEN') or os.getenv('GITHUB_POLLER_TOKEN') or ''
             ),
+            repos=[
+                r.strip() for r in os.getenv('TEAM_REPOS', '').split(',') if r.strip()
+            ],
             lead_model=os.getenv(
                 'TEAM_LEAD_MODEL', 'bedrock/us.anthropic.claude-sonnet-4-6'
             ),
