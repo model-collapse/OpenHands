@@ -10,6 +10,10 @@ in-process lifespan services wired into `openhands/app_server/app.py`; SQLite
 under `get_default_persistence_dir()` (`~/.openhands`); env-gated feature flag;
 routers mounted under `/api/v1`; agents spawned via `POST /api/v1/app-conversations`.
 
+> **§0–§11 below describe v1 (single implicit team) — BUILT and tested.**
+> **§12 is the v2 delta (multi-team + UI + conversation channel).** See
+> design `ai-team.md` v2 revisions + §14/§15. Read §12 for what changes.
+
 ---
 
 ## 0. Feature flag & module layout
@@ -511,3 +515,73 @@ child branch) in the fork.
 - No bidirectional comment mirroring (mostly-one-way, §7).
 - No new GitHub bot accounts (single lead identity, §2).
 - Persistent-service / reboot durability is deployment, not app scope (§12).
+
+---
+
+## 12. v2 implementation (multi-team + UI + conversation channel)
+
+Layered on the v1 code. Maps to design `ai-team.md` §14/§15 and the v2 build
+order. Each subsection is an independently landable phase.
+
+### 12.1 Schema migration (V1)
+- Add `teams(id PK, name UNIQUE, github_identity, repos_json,
+  lead_conversation_id, created_at, enabled)`.
+- Add `team_id` to `agents` (PK → `(team_id, role)`), `issues`, `comments`,
+  `events`, `inbox` (PK → `(team_id, role, issue_id)`), `sync_map`, and a new
+  per-team `kv` (PK → `(team_id, key)`). Index `team_id` on each.
+- `db.py`: bump `SCHEMA_VERSION`; add a migration that (a) creates `teams`,
+  (b) inserts a `default` team from current env (`TEAM_GITHUB_IDENTITY`,
+  `TEAM_REPOS`), (c) `ALTER TABLE … ADD COLUMN team_id` + backfill `'default'`.
+  Follow the additive `PRAGMA table_info` pattern already used.
+- `store.py`: bind a `TeamStore` to a `team_id` (constructor arg) OR add
+  `team_id` to every method. Prefer **bound instance** — `TeamStore(team_id=…)`
+  — so call sites stay clean and the audit invariant is unchanged. `is_synced`,
+  `get_issue_by_github_ref`, uniqueness all gain the `team_id` predicate.
+- **Tests:** rework the existing 86 to construct a team-scoped store; add a
+  migration test (single-team db → `default` team, no data loss); add an
+  isolation test (two teams don't see each other's issues/agents).
+
+### 12.2 Teams API (V2)
+- New `teams_router` (or extend): `GET /api/v1/teams` (list + per-team health),
+  `POST /api/v1/teams` (create → write `teams` row, spawn lead via bootstrap,
+  open lead conversation), and re-scope cockpit routes to
+  `/api/v1/teams/{team_id}/{dashboard,issues,issues/{id},agents,events}`.
+- Keep `/api/v1/team/*` as thin redirects to `…/teams/default/*` (compat).
+- `TeamService` holds a registry of per-team stores; `get_team_service()` gains
+  `store_for(team_id)`.
+
+### 12.3 Multi-team loops (V3)
+- `_sweep_loop` / `_reactive_loop` iterate `store.list_teams(enabled=True)`; per
+  team, build a team-scoped LeadSweep/ReactiveRouter/SyncBridge and run one pass.
+  Per-team spawn budget. A team with no repos/lead no-ops (already the behavior).
+
+### 12.4 Conversation channel (V4) — design §9
+- On `POST /teams`, start a conversation with the lead (reuse
+  `POST /api/v1/app-conversations`, the lead's agent config) and store its id in
+  `teams.lead_conversation_id`.
+- Ingest the human's turns in that conversation as guidance/commands. Mechanism:
+  an **event-callback processor** on that conversation (the app already posts
+  conversation events to `/api/v1/webhooks/events/{conversation_id}`), or a poll
+  of its events; map recognized intents (form team, prioritize, halt, assent) to
+  the same store actions the P7 GitHub-influence path uses (`GrandLeaderInfluence`
+  + `LeadBrain.form_team`). Same audit trail (events tagged with the
+  conversation_id). Halt/assent honored immediately.
+- This **supersedes** the P7 "GitHub comment is the primary human channel" for
+  the human↔lead path; the GitHub-comment influence path remains for external
+  issue commenters.
+
+### 12.5 Frontend (V5) — design §15
+- DAL: `frontend/src/api/team-service/…` (list teams, get team, dashboard,
+  agents, events, create team, get lead-conversation id).
+- Query hooks `frontend/src/hooks/query/useTeams`, `useTeam`, `useTeamBoard`,
+  `useTeamAgents`; mutation `useCreateTeam` (per the repo's strict layering rule).
+- Screens: **Teams list** (main-page entry), **Team detail** (board + roster +
+  "open lead conversation" that routes to the existing conversation screen using
+  `lead_conversation_id`). Read-mostly; no issue-state mutation controls.
+- Reuse the existing conversation UI for the lead chat — do not rebuild it.
+
+### 12.6 v2 non-goals
+- No GitHub-Projects/kanban parity; no drag-drop; no inline issue editing in the
+  UI (steering flows through the lead conversation).
+- No cross-team issue sharing or global board (each team is isolated; the Teams
+  list is the only cross-team view).
