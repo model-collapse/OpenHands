@@ -4,6 +4,11 @@ DB lives under the app persistence dir (``~/.openhands/team.db`` by default),
 alongside ``openhands.db``. Schema is created idempotently; additive migrations
 follow the ``PRAGMA table_info`` + ``ALTER TABLE`` pattern used elsewhere in the
 app-server (e.g. the github_poller).
+
+v2: every team-scoped table carries ``team_id`` and the root ``teams`` table
+holds per-team config. A v1 database (no ``teams`` table, no ``team_id`` columns)
+is migrated in place: a ``default`` team is created and existing rows are
+backfilled with ``team_id='default'`` so no data is lost (design §14).
 """
 
 from __future__ import annotations
@@ -12,6 +17,8 @@ import os
 import sqlite3
 
 from openhands.app_server.config import get_default_persistence_dir
+
+DEFAULT_TEAM_ID = 'default'
 
 
 def default_db_path() -> str:
@@ -36,10 +43,26 @@ def connect(db_path: str) -> sqlite3.Connection:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
 
-CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);  -- sync cursors, etc.
+CREATE TABLE IF NOT EXISTS teams(
+  id                   TEXT PRIMARY KEY,
+  name                 TEXT NOT NULL UNIQUE,
+  github_identity      TEXT,
+  repos_json           TEXT,                  -- JSON list of watched "owner/repo"
+  lead_conversation_id TEXT,                  -- grand-leader <-> lead chat (design §9)
+  enabled              INTEGER NOT NULL DEFAULT 1,
+  created_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kv(
+  team_id TEXT NOT NULL,
+  key     TEXT NOT NULL,
+  value   TEXT,
+  PRIMARY KEY(team_id, key)
+);
 
 CREATE TABLE IF NOT EXISTS agents(
-  role               TEXT PRIMARY KEY,
+  team_id            TEXT NOT NULL,
+  role               TEXT NOT NULL,
   display_name       TEXT NOT NULL,
   actor_kind         TEXT NOT NULL,
   agent_kind         TEXT,
@@ -50,11 +73,13 @@ CREATE TABLE IF NOT EXISTS agents(
   skills_json        TEXT,
   created_by_role    TEXT,
   enabled            INTEGER NOT NULL DEFAULT 1,
-  created_at         TEXT NOT NULL
+  created_at         TEXT NOT NULL,
+  PRIMARY KEY(team_id, role)
 );
 
 CREATE TABLE IF NOT EXISTS issues(
   id            TEXT PRIMARY KEY,
+  team_id       TEXT NOT NULL,
   origin        TEXT NOT NULL,
   github_ref    TEXT,
   repo          TEXT,
@@ -70,12 +95,14 @@ CREATE TABLE IF NOT EXISTS issues(
   updated_at    TEXT NOT NULL,
   stuck_since   TEXT
 );
-CREATE INDEX IF NOT EXISTS ix_issues_state ON issues(state);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_issues_github_ref
-  ON issues(github_ref) WHERE github_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_issues_team_state ON issues(team_id, state);
+-- github_ref is unique WITHIN a team (v2).
+CREATE UNIQUE INDEX IF NOT EXISTS ix_issues_team_github_ref
+  ON issues(team_id, github_ref) WHERE github_ref IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS comments(
   id                TEXT PRIMARY KEY,
+  team_id           TEXT NOT NULL,
   issue_id          TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
   author_role       TEXT NOT NULL,
   addressed_to      TEXT,
@@ -89,6 +116,7 @@ CREATE INDEX IF NOT EXISTS ix_comments_issue ON comments(issue_id, created_at);
 
 CREATE TABLE IF NOT EXISTS events(
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id         TEXT NOT NULL,
   issue_id        TEXT,
   actor_role      TEXT NOT NULL,
   kind            TEXT NOT NULL,
@@ -98,33 +126,95 @@ CREATE TABLE IF NOT EXISTS events(
   detail_json     TEXT,
   created_at      TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_events_issue ON events(issue_id, id);
+CREATE INDEX IF NOT EXISTS ix_events_team_issue ON events(team_id, issue_id, id);
 
 CREATE TABLE IF NOT EXISTS inbox(
+  team_id    TEXT NOT NULL,
   role       TEXT NOT NULL,
   issue_id   TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
   reason     TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  PRIMARY KEY(role, issue_id)
+  PRIMARY KEY(team_id, role, issue_id)
 );
 
 CREATE TABLE IF NOT EXISTS sync_map(
+  team_id        TEXT NOT NULL,
   internal_id    TEXT NOT NULL,
   github_ref     TEXT NOT NULL,
   kind           TEXT NOT NULL,
   last_synced_at TEXT NOT NULL,
-  PRIMARY KEY(internal_id, kind)
+  PRIMARY KEY(team_id, internal_id, kind)
 );
 """
 
-SCHEMA_VERSION = '1'
+SCHEMA_VERSION = '2'
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r['name'] for r in conn.execute(f'PRAGMA table_info({table})')}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Fold a pre-v2 (single-team) database into ``team_id='default'``.
+
+    Detected by an existing ``agents`` table that lacks a ``team_id`` column.
+    Adds ``team_id`` (default 'default') to each scoped table and seeds the
+    ``teams`` row from env. Additive + idempotent.
+    """
+    if not _table_exists(conn, 'agents'):
+        return  # brand-new db — _SCHEMA already created v2 tables
+    if 'team_id' in _table_columns(conn, 'agents'):
+        return  # already v2
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    repos = os.getenv('TEAM_REPOS', '')
+    identity = os.getenv('TEAM_GITHUB_IDENTITY')
+    import json as _json
+
+    repos_json = _json.dumps([r.strip() for r in repos.split(',') if r.strip()])
+    # Ensure the teams table exists before seeding (the full _SCHEMA runs after
+    # this migration; create the one table we need here).
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS teams('
+        ' id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, github_identity TEXT,'
+        ' repos_json TEXT, lead_conversation_id TEXT,'
+        ' enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)'
+    )
+    conn.execute(
+        'INSERT OR IGNORE INTO teams(id, name, github_identity, repos_json, '
+        'enabled, created_at) VALUES (?,?,?,?,1,?)',
+        (DEFAULT_TEAM_ID, DEFAULT_TEAM_ID, identity, repos_json, now),
+    )
+    # Add team_id to each old table and backfill 'default'. (SQLite lets us add
+    # a NOT NULL column only with a default; use a literal default then it's set
+    # on every existing row.)
+    for table in ('agents', 'issues', 'comments', 'events', 'inbox', 'sync_map', 'kv'):
+        if _table_exists(conn, table) and 'team_id' not in _table_columns(conn, table):
+            conn.execute(
+                f'ALTER TABLE {table} ADD COLUMN team_id TEXT NOT NULL '
+                f"DEFAULT '{DEFAULT_TEAM_ID}'"
+            )
+    conn.commit()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create the schema idempotently and stamp the version."""
+    """Create/upgrade the schema idempotently and stamp the version."""
+    # Migrate a v1 db BEFORE creating v2 tables, so the ALTERs see old tables.
+    _migrate_v1_to_v2(conn)
     conn.executescript(_SCHEMA)
     conn.execute(
-        'INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?, ?)',
+        'INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)',
         ('schema_version', SCHEMA_VERSION),
     )
     conn.commit()

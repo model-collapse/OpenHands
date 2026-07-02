@@ -62,15 +62,85 @@ def _new_id() -> str:
 
 
 class TeamStore:
-    def __init__(self, db_path: str | None = None) -> None:
+    """Team-scoped data access.
+
+    A store instance is bound to one ``team_id`` (default ``'default'``); every
+    query is filtered by it, so two teams are fully isolated. The underlying
+    SQLite connection may be shared across team stores via ``from_existing``.
+    """
+
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        team_id: str = _db.DEFAULT_TEAM_ID,
+        _conn: sqlite3.Connection | None = None,
+        _lock: threading.RLock | None = None,
+    ) -> None:
         self.db_path = db_path or _db.default_db_path()
-        self._lock = threading.RLock()
-        self._conn = _db.connect(self.db_path)
-        _db.init_db(self._conn)
+        self.team_id = team_id
+        if _conn is not None:
+            # Share an already-initialized connection + lock (multi-team: one
+            # connection, many team-scoped stores).
+            self._conn = _conn
+            self._lock = _lock or threading.RLock()
+        else:
+            self._lock = threading.RLock()
+            self._conn = _db.connect(self.db_path)
+            _db.init_db(self._conn)
+
+    def for_team(self, team_id: str) -> 'TeamStore':
+        """A sibling store bound to another team, sharing this connection+lock."""
+        return TeamStore(
+            self.db_path, team_id=team_id, _conn=self._conn, _lock=self._lock
+        )
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # -- teams (cross-team; not team_id-filtered) --------------------------
+    @_locked
+    def create_team(
+        self,
+        *,
+        team_id: str,
+        name: str,
+        github_identity: str | None = None,
+        repos: list[str] | None = None,
+    ) -> dict:
+        import json as _json
+
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                'INSERT OR IGNORE INTO teams(id, name, github_identity, repos_json, '
+                'enabled, created_at) VALUES (?,?,?,?,1,?)',
+                (team_id, name, github_identity, _json.dumps(repos or []), now),
+            )
+        return self.get_team(team_id)  # type: ignore[return-value]
+
+    @_locked
+    def get_team(self, team_id: str) -> dict | None:
+        row = self._conn.execute(
+            'SELECT * FROM teams WHERE id=?', (team_id,)
+        ).fetchone()
+        return _row_to_team(row) if row else None
+
+    @_locked
+    def list_teams(self, enabled_only: bool = False) -> list[dict]:
+        q = 'SELECT * FROM teams'
+        if enabled_only:
+            q += ' WHERE enabled=1'
+        return [_row_to_team(r) for r in self._conn.execute(q + ' ORDER BY name')]
+
+    @_locked
+    def set_team_conversation(self, team_id: str, conversation_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                'UPDATE teams SET lead_conversation_id=? WHERE id=?',
+                (conversation_id, team_id),
+            )
 
     # -- agents ------------------------------------------------------------
     @_locked
@@ -78,17 +148,18 @@ class TeamStore:
         created = agent.created_at or _now()
         with self._conn:  # transaction
             self._conn.execute(
-                'INSERT INTO agents(role, display_name, actor_kind, agent_kind, '
-                'acp_server, github_identity, llm_model, launch_config_json, '
-                'skills_json, created_by_role, enabled, created_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?) '
-                'ON CONFLICT(role) DO UPDATE SET '
+                'INSERT INTO agents(team_id, role, display_name, actor_kind, '
+                'agent_kind, acp_server, github_identity, llm_model, '
+                'launch_config_json, skills_json, created_by_role, enabled, '
+                'created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) '
+                'ON CONFLICT(team_id, role) DO UPDATE SET '
                 'display_name=excluded.display_name, actor_kind=excluded.actor_kind, '
                 'agent_kind=excluded.agent_kind, acp_server=excluded.acp_server, '
                 'github_identity=excluded.github_identity, llm_model=excluded.llm_model, '
                 'launch_config_json=excluded.launch_config_json, '
                 'skills_json=excluded.skills_json, enabled=excluded.enabled',
                 (
+                    self.team_id,
                     agent.role,
                     agent.display_name,
                     agent.actor_kind.value,
@@ -111,6 +182,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=_now(),
                 actor_role=agent.created_by_role or agent.role,
                 kind=kind,
@@ -127,16 +199,19 @@ class TeamStore:
     @_locked
     def get_agent(self, role: str) -> Agent | None:
         row = self._conn.execute(
-            'SELECT * FROM agents WHERE role=?', (role,)
+            'SELECT * FROM agents WHERE team_id=? AND role=?', (self.team_id, role)
         ).fetchone()
         return _row_to_agent(row) if row else None
 
     @_locked
     def list_agents(self, enabled_only: bool = False) -> list[Agent]:
-        q = 'SELECT * FROM agents'
+        q = 'SELECT * FROM agents WHERE team_id=?'
         if enabled_only:
-            q += ' WHERE enabled=1'
-        return [_row_to_agent(r) for r in self._conn.execute(q + ' ORDER BY role')]
+            q += ' AND enabled=1'
+        return [
+            _row_to_agent(r)
+            for r in self._conn.execute(q + ' ORDER BY role', (self.team_id,))
+        ]
 
     # -- issues ------------------------------------------------------------
     @_locked
@@ -156,11 +231,12 @@ class TeamStore:
         now = _now()
         with self._conn:
             self._conn.execute(
-                'INSERT INTO issues(id, origin, github_ref, repo, title, body, '
-                'author_role, state, priority, created_at, updated_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                'INSERT INTO issues(id, team_id, origin, github_ref, repo, title, '
+                'body, author_role, state, priority, created_at, updated_at) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                 (
                     issue_id,
+                    self.team_id,
                     origin.value,
                     github_ref,
                     repo,
@@ -175,6 +251,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=author_role,
                 kind=EventKind.STATE_CHANGE,
@@ -187,15 +264,18 @@ class TeamStore:
 
     @_locked
     def get_issue(self, issue_id: str) -> Issue | None:
+        # id is a global PK, but scope by team_id so a store can't read another
+        # team's issue by id.
         row = self._conn.execute(
-            'SELECT * FROM issues WHERE id=?', (issue_id,)
+            'SELECT * FROM issues WHERE id=? AND team_id=?', (issue_id, self.team_id)
         ).fetchone()
         return _row_to_issue(row) if row else None
 
     @_locked
     def get_issue_by_github_ref(self, github_ref: str) -> Issue | None:
         row = self._conn.execute(
-            'SELECT * FROM issues WHERE github_ref=?', (github_ref,)
+            'SELECT * FROM issues WHERE team_id=? AND github_ref=?',
+            (self.team_id, github_ref),
         ).fetchone()
         return _row_to_issue(row) if row else None
 
@@ -206,17 +286,15 @@ class TeamStore:
         states: list[State] | None = None,
         assignee: str | None = None,
     ) -> list[Issue]:
-        clauses: list[str] = []
-        params: list[str] = []
+        clauses: list[str] = ['team_id=?']
+        params: list[str] = [self.team_id]
         if states:
             clauses.append('state IN (%s)' % ','.join('?' for _ in states))
             params.extend(s.value for s in states)
         if assignee:
             clauses.append('assignee_role=?')
             params.append(assignee)
-        q = 'SELECT * FROM issues'
-        if clauses:
-            q += ' WHERE ' + ' AND '.join(clauses)
+        q = 'SELECT * FROM issues WHERE ' + ' AND '.join(clauses)
         q += ' ORDER BY updated_at DESC'
         return [_row_to_issue(r) for r in self._conn.execute(q, params)]
 
@@ -245,6 +323,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=actor_role,
                 kind=EventKind.STATE_CHANGE,
@@ -290,6 +369,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=actor_role,
                 kind=EventKind.PRIORITY,
@@ -309,6 +389,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=actor_role,
                 kind=EventKind.RISK,
@@ -331,6 +412,7 @@ class TeamStore:
             count = int(row['round_count']) if row else 0
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=actor_role,
                 kind=EventKind.ROUND,
@@ -349,6 +431,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=actor_role,
                 kind=EventKind.STUCK,
@@ -373,11 +456,12 @@ class TeamStore:
         now = _now()
         with self._conn:
             self._conn.execute(
-                'INSERT INTO comments(id, issue_id, author_role, addressed_to, '
-                'provenance, conversation_id, github_comment_id, body, created_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?)',
+                'INSERT INTO comments(id, team_id, issue_id, author_role, '
+                'addressed_to, provenance, conversation_id, github_comment_id, '
+                'body, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
                 (
                     comment_id,
+                    self.team_id,
                     issue_id,
                     author_role,
                     addressed_to,
@@ -390,6 +474,7 @@ class TeamStore:
             )
             record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=now,
                 actor_role=author_role,
                 kind=EventKind.COMMENT,
@@ -414,8 +499,9 @@ class TeamStore:
         return [
             _row_to_comment(r)
             for r in self._conn.execute(
-                'SELECT * FROM comments WHERE issue_id=? ORDER BY created_at, id',
-                (issue_id,),
+                'SELECT * FROM comments WHERE team_id=? AND issue_id=? '
+                'ORDER BY created_at, id',
+                (self.team_id, issue_id),
             )
         ]
 
@@ -424,12 +510,14 @@ class TeamStore:
     def list_events(self, issue_id: str | None = None, limit: int = 200) -> list[Event]:
         if issue_id is not None:
             rows = self._conn.execute(
-                'SELECT * FROM events WHERE issue_id=? ORDER BY id LIMIT ?',
-                (issue_id, limit),
+                'SELECT * FROM events WHERE team_id=? AND issue_id=? '
+                'ORDER BY id LIMIT ?',
+                (self.team_id, issue_id, limit),
             )
         else:
             rows = self._conn.execute(
-                'SELECT * FROM events ORDER BY id DESC LIMIT ?', (limit,)
+                'SELECT * FROM events WHERE team_id=? ORDER BY id DESC LIMIT ?',
+                (self.team_id, limit),
             )
         return [_row_to_event(r) for r in rows]
 
@@ -447,6 +535,7 @@ class TeamStore:
         with self._conn:
             return record_event(
                 self._conn,
+                team_id=self.team_id,
                 now=_now(),
                 actor_role=actor_role,
                 kind=kind,
@@ -460,9 +549,9 @@ class TeamStore:
     def inbox_add(self, role: str, issue_id: str, reason: str) -> None:
         with self._conn:
             self._conn.execute(
-                'INSERT OR REPLACE INTO inbox(role, issue_id, reason, created_at) '
-                'VALUES (?,?,?,?)',
-                (role, issue_id, reason, _now()),
+                'INSERT OR REPLACE INTO inbox(team_id, role, issue_id, reason, '
+                'created_at) VALUES (?,?,?,?,?)',
+                (self.team_id, role, issue_id, reason, _now()),
             )
 
     @_locked
@@ -470,8 +559,9 @@ class TeamStore:
         return [
             (r['issue_id'], r['reason'])
             for r in self._conn.execute(
-                'SELECT issue_id, reason FROM inbox WHERE role=? ORDER BY created_at',
-                (role,),
+                'SELECT issue_id, reason FROM inbox WHERE team_id=? AND role=? '
+                'ORDER BY created_at',
+                (self.team_id, role),
             )
         ]
 
@@ -479,16 +569,18 @@ class TeamStore:
     def inbox_clear(self, role: str, issue_id: str) -> None:
         with self._conn:
             self._conn.execute(
-                'DELETE FROM inbox WHERE role=? AND issue_id=?', (role, issue_id)
+                'DELETE FROM inbox WHERE team_id=? AND role=? AND issue_id=?',
+                (self.team_id, role, issue_id),
             )
 
     @_locked
     def latest_spawn_conversation(self, issue_id: str) -> str | None:
         """The conversation id of the most recent spawn event for an issue."""
         row = self._conn.execute(
-            "SELECT conversation_id FROM events WHERE issue_id=? AND kind='spawn' "
-            'AND conversation_id IS NOT NULL ORDER BY id DESC LIMIT 1',
-            (issue_id,),
+            'SELECT conversation_id FROM events WHERE team_id=? AND issue_id=? '
+            "AND kind='spawn' AND conversation_id IS NOT NULL "
+            'ORDER BY id DESC LIMIT 1',
+            (self.team_id, issue_id),
         ).fetchone()
         return row['conversation_id'] if row else None
 
@@ -497,42 +589,59 @@ class TeamStore:
     def map_sync(self, internal_id: str, github_ref: str, kind: str) -> None:
         with self._conn:
             self._conn.execute(
-                'INSERT OR REPLACE INTO sync_map(internal_id, github_ref, kind, '
-                'last_synced_at) VALUES (?,?,?,?)',
-                (internal_id, github_ref, kind, _now()),
+                'INSERT OR REPLACE INTO sync_map(team_id, internal_id, github_ref, '
+                'kind, last_synced_at) VALUES (?,?,?,?,?)',
+                (self.team_id, internal_id, github_ref, kind, _now()),
             )
 
     # -- kv (sync cursors, small state) -----------------------------------
     @_locked
     def kv_get(self, key: str, default: str | None = None) -> str | None:
-        row = self._conn.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
+        row = self._conn.execute(
+            'SELECT value FROM kv WHERE team_id=? AND key=?', (self.team_id, key)
+        ).fetchone()
         return row['value'] if row else default
 
     @_locked
     def kv_set(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
-                'INSERT OR REPLACE INTO kv(key, value) VALUES (?,?)', (key, value)
+                'INSERT OR REPLACE INTO kv(team_id, key, value) VALUES (?,?,?)',
+                (self.team_id, key, value),
             )
 
     @_locked
     def is_synced(self, key: str, kind: str) -> bool:
         """Whether a sync_map row exists for ``key`` (matched against EITHER the
-        ``internal_id`` or ``github_ref`` column). Callers use different
-        identifiers per kind — issues check by github_ref, comments by the
-        github comment id — so matching either column keeps the dedup correct
+        ``internal_id`` or ``github_ref`` column), within this team. Callers use
+        different identifiers per kind — issues check by github_ref, comments by
+        the github comment id — so matching either column keeps the dedup correct
         regardless of which the caller passes."""
         return (
             self._conn.execute(
-                'SELECT 1 FROM sync_map WHERE kind=? AND (github_ref=? OR '
-                'internal_id=?)',
-                (kind, key, key),
+                'SELECT 1 FROM sync_map WHERE team_id=? AND kind=? AND '
+                '(github_ref=? OR internal_id=?)',
+                (self.team_id, kind, key, key),
             ).fetchone()
             is not None
         )
 
 
 # -- row -> dataclass helpers ---------------------------------------------
+def _row_to_team(r: sqlite3.Row) -> dict:
+    import json
+
+    return {
+        'id': r['id'],
+        'name': r['name'],
+        'github_identity': r['github_identity'],
+        'repos': json.loads(r['repos_json']) if r['repos_json'] else [],
+        'lead_conversation_id': r['lead_conversation_id'],
+        'enabled': bool(r['enabled']),
+        'created_at': r['created_at'],
+    }
+
+
 def _row_to_agent(r: sqlite3.Row) -> Agent:
     return Agent(
         role=r['role'],

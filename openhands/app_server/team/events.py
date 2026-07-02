@@ -17,6 +17,7 @@ from openhands.app_server.team.models import EventKind
 def record_event(
     conn: sqlite3.Connection,
     *,
+    team_id: str,
     now: str,
     actor_role: str,
     kind: EventKind,
@@ -32,9 +33,11 @@ def record_event(
     are centralized in the store for testability. Returns the new event id.
     """
     cur = conn.execute(
-        'INSERT INTO events(issue_id, actor_role, kind, from_state, to_state, '
-        'conversation_id, detail_json, created_at) VALUES (?,?,?,?,?,?,?,?)',
+        'INSERT INTO events(team_id, issue_id, actor_role, kind, from_state, '
+        'to_state, conversation_id, detail_json, created_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?)',
         (
+            team_id,
             issue_id,
             actor_role,
             kind.value,
