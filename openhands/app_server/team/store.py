@@ -451,6 +451,17 @@ class TeamStore:
                 (internal_id, github_ref, kind, _now()),
             )
 
+    # -- kv (sync cursors, small state) -----------------------------------
+    def kv_get(self, key: str, default: str | None = None) -> str | None:
+        row = self._conn.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
+        return row['value'] if row else default
+
+    def kv_set(self, key: str, value: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                'INSERT OR REPLACE INTO kv(key, value) VALUES (?,?)', (key, value)
+            )
+
     def is_synced(self, github_ref: str, kind: str) -> bool:
         return (
             self._conn.execute(

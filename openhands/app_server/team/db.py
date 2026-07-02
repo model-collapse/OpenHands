@@ -31,6 +31,8 @@ def connect(db_path: str) -> sqlite3.Connection:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
 
+CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);  -- sync cursors, etc.
+
 CREATE TABLE IF NOT EXISTS agents(
   role               TEXT PRIMARY KEY,
   display_name       TEXT NOT NULL,
