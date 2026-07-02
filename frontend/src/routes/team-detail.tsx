@@ -20,11 +20,25 @@ function TeamDetailScreen() {
   const navigate = useNavigate();
   const { data: board, isLoading } = useTeamBoard(teamId, "all");
   const { data: agents } = useTeamAgents(teamId);
-  const { data: leadConversationId } = useTeamLeadConversation(teamId);
+  const { data: leadConversationId, refetch: refetchLeadConvo } =
+    useTeamLeadConversation(teamId);
+  const [opening, setOpening] = React.useState(false);
 
-  const openLeadChat = () => {
+  const openLeadChat = async () => {
     if (leadConversationId) {
       navigate(`/conversations/${leadConversationId}`);
+      return;
+    }
+    // Not opened yet — the endpoint lazily starts it (sandbox needs a few
+    // seconds to reach READY). Refetch until we get a real conversation id.
+    setOpening(true);
+    try {
+      const { data } = await refetchLeadConvo();
+      if (data) {
+        navigate(`/conversations/${data}`);
+      }
+    } finally {
+      setOpening(false);
     }
   };
 
@@ -41,16 +55,12 @@ function TeamDetailScreen() {
         <button
           type="button"
           onClick={openLeadChat}
-          disabled={!leadConversationId}
+          disabled={opening}
           data-testid="open-lead-conversation"
           className="bg-primary text-black rounded-md px-4 py-2 text-sm font-medium disabled:opacity-50"
-          title={
-            leadConversationId
-              ? "Talk to the team lead"
-              : "No lead conversation yet"
-          }
+          title="Talk to the team lead"
         >
-          Open lead conversation
+          {opening ? "Opening…" : "Open lead conversation"}
         </button>
       </div>
 

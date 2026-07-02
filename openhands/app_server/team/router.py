@@ -144,7 +144,15 @@ async def create_team(request: Request) -> dict:
 
 
 async def _open_lead_conversation(svc, store, team_id: str, name: str) -> str | None:
-    """Start the lead's conversation and persist its id on the team row."""
+    """Start the lead's conversation and persist the real conversation id.
+
+    ``POST /app-conversations`` returns a *start task* whose ``id`` is NOT the
+    conversation id — the conversation id is ``app_conversation_id``, populated
+    once the sandbox reaches READY. We therefore poll the start task briefly and
+    store ``app_conversation_id`` (never the task id, which the UI can't open).
+    """
+    import asyncio
+
     import httpx
 
     existing = svc.base_store.get_team(team_id)
@@ -165,16 +173,40 @@ async def _open_lead_conversation(svc, store, team_id: str, name: str) -> str | 
         },
         'llm_model': svc.config.lead_model,
     }
+    base = svc.config.self_url
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
-                f'{svc.config.self_url}/api/v1/app-conversations',
-                json=payload,
-                timeout=60.0,
+                f'{base}/api/v1/app-conversations', json=payload, timeout=60.0
             )
             r.raise_for_status()
             data = r.json()
-            cid = data.get('app_conversation_id') or data.get('id')
+            cid = data.get('app_conversation_id')
+            task_id = data.get('id')
+            # Poll the start task until the sandbox is READY and the real
+            # conversation id is known (bounded; don't block team creation long).
+            for _ in range(30):
+                if cid:
+                    break
+                if not task_id:
+                    break
+                await asyncio.sleep(1.0)
+                tr = await client.get(
+                    f'{base}/api/v1/app-conversations/start-tasks/search',
+                    params={'ids': task_id},
+                    timeout=15.0,
+                )
+                tr.raise_for_status()
+                tdata = tr.json()
+                items = tdata if isinstance(tdata, list) else tdata.get('items', [])
+                match = next((t for t in items if t.get('id') == task_id), None)
+                if match is None:
+                    continue
+                if match.get('app_conversation_id'):
+                    cid = match['app_conversation_id']
+                    break
+                if match.get('status') == 'ERROR':
+                    break
     except Exception:  # noqa: BLE001
         return None
     if cid:
@@ -313,12 +345,22 @@ async def list_events(
 
 @router.get('/{team_id}/lead-conversation')
 async def lead_conversation(team_id: str) -> dict:
-    """The id of the grand-leader<->lead conversation, so the UI can open it."""
+    """The id of the grand-leader<->lead conversation, so the UI can open it.
+
+    Lazily opens the conversation if the team doesn't have one yet (e.g. created
+    before this existed, or the first open failed), so the "Open lead
+    conversation" button always resolves to a real, accessible conversation.
+    """
     svc = get_team_service()
     team = svc.base_store.get_team(team_id)
     if team is None:
         raise HTTPException(404, f'no such team: {team_id}')
-    return {'team_id': team_id, 'conversation_id': team.get('lead_conversation_id')}
+    cid = team.get('lead_conversation_id')
+    if not cid:
+        cid = await _open_lead_conversation(
+            svc, svc.store_for(team_id), team_id, team.get('name') or team_id
+        )
+    return {'team_id': team_id, 'conversation_id': cid}
 
 
 # =====================================================================
