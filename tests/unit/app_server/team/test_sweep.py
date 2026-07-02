@@ -192,6 +192,34 @@ async def test_round_cap_forces_decision(store):
 
 
 @pytest.mark.asyncio
+async def test_reassign_changes_assignee(store):
+    lead = LeadBrain(
+        store,
+        model='m',
+        think_fn=_canned(
+            {
+                'action': 'reassign',
+                'rationale': 'reviewer is a better fit',
+                'new_assignee': 'reviewer',
+            }
+        ),
+    )
+    issue = _new_issue(store, state=State.DISCUSSING)
+    store.transition(
+        issue.id,
+        to_state=State.DISCUSSING,
+        actor_role='lead',
+        reason='x',
+        assignee_role='eng:backend',
+    )
+    await LeadSweep(store, lead).run_once()
+    updated = store.get_issue(issue.id)
+    assert updated.state == State.ASSIGNED
+    assert updated.assignee_role == 'reviewer'
+    assert updated.round_count == 1
+
+
+@pytest.mark.asyncio
 async def test_pushback_under_cap_stays_discussing(store):
     lead = LeadBrain(
         store,

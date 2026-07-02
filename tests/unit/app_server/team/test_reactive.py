@@ -230,6 +230,51 @@ async def test_in_progress_error_escalates(store):
     assert any(iid == issue.id for iid, _ in store.inbox_list(ROLE_GRAND_LEADER))
 
 
+class FailSpawner:
+    """Spawner whose spawn() fails (returns None)."""
+
+    async def spawn(self, *, role, issue, instruction, **kw):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_committed_spawn_failure_requeues_to_assigned(store):
+    global issue_store
+    issue_store = store
+    issue = _assigned_issue(store)
+    store.transition(
+        issue.id, to_state=State.COMMITTED, actor_role='lead', reason='commit'
+    )
+    router = ReactiveRouter(
+        store,
+        FailSpawner(),
+        engineer_status_fn=_status_running,
+        assignee_eval_fn=_eval_fn({}),
+    )
+    await router.run_once()
+    # spawn failed -> re-queued to assigned (not left committed / not in_progress)
+    assert store.get_issue(issue.id).state == State.ASSIGNED
+
+
+@pytest.mark.asyncio
+async def test_halted_issue_is_untouched(store):
+    global issue_store
+    issue_store = store
+    issue = _assigned_issue(store)
+    store.transition(
+        issue.id, to_state=State.HALTED, actor_role='grand_leader', reason='stop'
+    )
+    router = ReactiveRouter(
+        store,
+        FakeSpawner(),
+        engineer_status_fn=_status_running,
+        assignee_eval_fn=_eval_fn({'decision': 'accept', 'notes': 'x'}),
+    )
+    n = await router.run_once()
+    assert n == 0  # halted issues are not acted on
+    assert store.get_issue(issue.id).state == State.HALTED
+
+
 @pytest.mark.asyncio
 async def test_halt(store):
     global issue_store

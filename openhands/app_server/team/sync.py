@@ -37,9 +37,11 @@ from openhands.app_server.team.store import TeamStore
 
 logger = logging.getLogger(__name__)
 
-# States that a human applying a GitHub label may drive the issue to. We only
-# honor *forward* label edits for a small, safe set (the grand-leader gate +
-# stop); full state is otherwise owned by the loops.
+# A human applying a GitHub label may only drive these transitions (design
+# §5/§9): HALTED is always honored (the grand-leader escape hatch); COMMITTED is
+# honored ONLY as grand-leader assent releasing an ``awaiting_gl`` issue (the
+# risk-tripwire gate). A human must NOT be able to commit an arbitrary issue —
+# committing is the lead's authority. Enforced in _apply_human_label_change.
 HUMAN_LABEL_STATES = {State.COMMITTED, State.HALTED}
 
 # Ordering used to decide whether a label maps to a state "ahead of" ours, so a
@@ -181,11 +183,28 @@ class SyncBridge:
             return
         if _STATE_ORDER.get(target_state, 0) <= _STATE_ORDER.get(issue.state, 0):
             return
+        # The lead owns the commit gate (design §5). A human `committed` label is
+        # honored ONLY as grand-leader assent on an awaiting_gl issue (releasing
+        # the risk tripwire, §9) — never to commit an arbitrary issue. HALTED is
+        # always allowed (escape hatch, §9).
+        if target_state == State.COMMITTED and issue.state != State.AWAITING_GL:
+            logger.info(
+                'sync: ignoring human committed label on %s (state=%s); commit is '
+                "the lead's gate — not honored outside awaiting_gl",
+                github_ref,
+                issue.state.value,
+            )
+            return
+        reason = (
+            'grand-leader assent released awaiting_gl via label'
+            if target_state == State.COMMITTED
+            else f'human applied GitHub label -> {target_state.value}'
+        )
         self.store.transition(
             issue.id,
             to_state=target_state,
             actor_role=ROLE_GRAND_LEADER,
-            reason=f'human applied GitHub label -> {target_state.value}',
+            reason=reason,
         )
         logger.info(
             'sync: %s advanced to %s via human label', github_ref, target_state.value

@@ -14,6 +14,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
 from openhands.app_server.team.config import TeamConfig
 from openhands.app_server.team.models import TERMINAL_STATES, Origin, State
@@ -238,3 +239,48 @@ async def bootstrap(request: Request) -> dict:
         'lead_exists': lead.role == ROLE_LEAD,
         'formation_issue_id': formation_issue_id,
     }
+
+
+_UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>AI Team — cockpit</title><style>
+ body{font-family:system-ui,sans-serif;max-width:900px;margin:32px auto;padding:0 16px;color:#222}
+ h1{font-size:20px} h2{font-size:15px;margin:18px 0 6px;color:#555}
+ .row{display:flex;gap:8px;align-items:center;margin:4px 0}
+ .card{border:1px solid #e5e5e5;border-radius:8px;padding:8px 10px;margin:4px 0}
+ .muted{color:#888;font-size:12px} .tag{font-size:11px;background:#f0f0f0;border-radius:4px;padding:1px 6px}
+ .risk{background:#fde2e2;color:#a00} a{color:#0366d6;text-decoration:none}
+ code{background:#f4f4f4;padding:1px 5px;border-radius:4px}
+</style></head><body>
+<h1>AI Team — supervisor cockpit</h1>
+<p class="muted">Read-only. Default view surfaces only what needs the grand leader.
+ Switch: <a href="#" onclick="load('attention')">attention</a> ·
+ <a href="#" onclick="load('open')">open</a> · <a href="#" onclick="load('all')">all</a></p>
+<div id="board"></div>
+<script>
+async function load(filter){
+ filter = filter || 'attention';
+ const d = await (await fetch('./dashboard?filter='+filter)).json();
+ const el = document.getElementById('board'); el.innerHTML='';
+ const states = Object.keys(d.by_state);
+ if(!states.length){ el.innerHTML='<p class="muted">Nothing to show for filter <code>'+filter+'</code>.</p>'; return; }
+ for(const st of states){
+   const h=document.createElement('h2'); h.textContent=st+' ('+d.by_state[st].length+')'; el.appendChild(h);
+   for(const i of d.by_state[st]){
+     const c=document.createElement('div'); c.className='card';
+     const risk = i.risk ? ' <span class="tag risk">risk:'+i.risk+'</span>' : '';
+     const who = i.assignee_role ? ' <span class="tag">'+i.assignee_role+'</span>' : '';
+     const ref = i.github_ref ? ' <span class="muted">'+i.github_ref+'</span>' : '';
+     c.innerHTML = '<b>'+ (i.title||'(untitled)') +'</b>'+who+risk+ref+
+       '<div class="muted">'+i.id.slice(0,8)+' · priority '+i.priority+'</div>';
+     el.appendChild(c);
+   }
+ }
+}
+load('attention');
+</script></body></html>"""
+
+
+@router.get('/ui', response_class=HTMLResponse)
+async def ui() -> HTMLResponse:
+    """A thin read-only board grouped by state (design §10 — no GitHub parity)."""
+    return HTMLResponse(_UI_HTML)

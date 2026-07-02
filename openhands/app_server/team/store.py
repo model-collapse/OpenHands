@@ -516,11 +516,17 @@ class TeamStore:
             )
 
     @_locked
-    def is_synced(self, github_ref: str, kind: str) -> bool:
+    def is_synced(self, key: str, kind: str) -> bool:
+        """Whether a sync_map row exists for ``key`` (matched against EITHER the
+        ``internal_id`` or ``github_ref`` column). Callers use different
+        identifiers per kind — issues check by github_ref, comments by the
+        github comment id — so matching either column keeps the dedup correct
+        regardless of which the caller passes."""
         return (
             self._conn.execute(
-                'SELECT 1 FROM sync_map WHERE github_ref=? AND kind=?',
-                (github_ref, kind),
+                'SELECT 1 FROM sync_map WHERE kind=? AND (github_ref=? OR '
+                'internal_id=?)',
+                (kind, key, key),
             ).fetchone()
             is not None
         )

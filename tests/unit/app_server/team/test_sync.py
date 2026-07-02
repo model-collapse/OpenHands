@@ -149,14 +149,44 @@ async def test_comment_dedup(bridge, store, gh):
 
 @pytest.mark.asyncio
 async def test_human_label_advances_state(bridge, store, gh):
+    # `halted` is the always-honored human label (escape hatch); a human adding
+    # it on GitHub advances the internal issue to HALTED. (Commit-via-label is
+    # gated separately — see the awaiting_gl tests.)
     gh.add_issue(1, 'Fix the bug')
     await bridge.import_repo('o/r')
-    # human adds 'committed' on GitHub
-    gh.issues[1]['labels'] = [{'name': 'committed'}]
+    gh.issues[1]['labels'] = [{'name': 'halted'}]
     gh.issues[1]['updated_at'] = '2026-07-02T02:00:00Z'
     await bridge.import_repo('o/r')
     issue = store.get_issue_by_github_ref('o/r#1')
-    assert issue.state == State.COMMITTED
+    assert issue.state == State.HALTED
+
+
+@pytest.mark.asyncio
+async def test_human_committed_label_ignored_unless_awaiting_gl(bridge, store, gh):
+    """A human `committed` label must NOT bypass the lead's commit gate (design
+    §5): it is honored only as grand-leader assent on an awaiting_gl issue."""
+    gh.add_issue(1, 'Fix the bug')
+    await bridge.import_repo('o/r')
+    issue = store.get_issue_by_github_ref('o/r#1')
+    # issue is in needs_triage; a human slapping `committed` should be ignored
+    gh.issues[1]['labels'] = [{'name': 'committed'}]
+    await bridge.import_repo('o/r')
+    assert store.get_issue(issue.id).state == State.NEEDS_TRIAGE  # not committed
+
+
+@pytest.mark.asyncio
+async def test_human_committed_label_releases_awaiting_gl(bridge, store, gh):
+    """On an awaiting_gl issue, a human `committed` label IS honored (grand-leader
+    assent releasing the risk tripwire, §9)."""
+    gh.add_issue(1, 'risky')
+    await bridge.import_repo('o/r')
+    issue = store.get_issue_by_github_ref('o/r#1')
+    store.transition(
+        issue.id, to_state=State.AWAITING_GL, actor_role='lead', reason='gate'
+    )
+    gh.issues[1]['labels'] = [{'name': 'committed'}]
+    await bridge.import_repo('o/r')
+    assert store.get_issue(issue.id).state == State.COMMITTED
 
 
 @pytest.mark.asyncio

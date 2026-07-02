@@ -160,6 +160,49 @@ def test_agents_listing(client):
     assert 'lead' in roles
 
 
+def test_events_endpoint(client):
+    tc, store = client
+    issue = store.create_issue(
+        origin=Origin.GITHUB, title='t', author_role='lead', state=State.NEEDS_TRIAGE
+    )
+    r = tc.get(f'/api/v1/team/events?issue_id={issue.id}')
+    assert r.status_code == 200
+    kinds = [e['kind'] for e in r.json()['items']]
+    assert EventKind.STATE_CHANGE.value in kinds
+
+
+def test_ui_endpoint_serves_board(client):
+    tc, _ = client
+    r = tc.get('/api/v1/team/ui')
+    assert r.status_code == 200
+    assert 'text/html' in r.headers['content-type']
+    assert 'supervisor cockpit' in r.text
+
+
+def test_bootstrap_creates_lead(client):
+    tc, store = client
+    r = tc.post('/api/v1/team/bootstrap', json={'github_identity': 'model-collapse'})
+    assert r.status_code == 200
+    body = r.json()
+    assert body['lead']['role'] == 'lead'
+    assert body['lead']['github_identity'] == 'model-collapse'
+    assert store.get_agent('lead') is not None
+    assert store.get_agent('grand_leader') is not None
+
+
+def test_bootstrap_with_needs_opens_formation_issue(client):
+    tc, store = client
+    r = tc.post(
+        '/api/v1/team/bootstrap',
+        json={'github_identity': 'mc', 'needs': 'a backend engineer'},
+    )
+    fid = r.json()['formation_issue_id']
+    assert fid is not None
+    # marker set so the sweep will run form_team
+    assert store.kv_get(f'formation:{fid}') == 'a backend engineer'
+    assert store.get_issue(fid).state == State.INTERNAL
+
+
 def test_no_issue_state_mutation_endpoints():
     """The cockpit does not mutate *issue state* (design §9). The only write is
     the administrative /bootstrap setup endpoint; everything else is read-only."""
