@@ -30,14 +30,19 @@ function HomeScreen() {
       <HomeHeader />
 
       {/* eslint-disable i18next/no-literal-string */}
-      <div className="pt-3 flex justify-center">
+      <div className="pt-4 flex justify-center">
         <div className="flex px-6 lg:px-0 lg:max-w-[703px] lg:min-w-[703px] w-full">
           <Link
             to="/teams"
             data-testid="home-teams-entry"
-            className="text-sm text-neutral-300 hover:text-white underline underline-offset-2"
+            className="flex items-center gap-2 rounded-xl border border-primary/60 bg-primary/10 px-4 py-2.5 text-sm font-medium text-white hover:bg-primary/20 transition-colors"
           >
-            AI Teams →
+            <span className="text-base">👥</span>
+            <span>AI Teams</span>
+            <span className="text-neutral-400">
+              — create &amp; supervise multi-agent teams
+            </span>
+            <span className="ml-auto">→</span>
           </Link>
         </div>
       </div>
