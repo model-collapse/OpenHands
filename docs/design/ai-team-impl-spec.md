@@ -275,15 +275,51 @@ class AgentSpawner:
         return cid
 ```
 
-**What Phase 2 spikes is the *transport*, not the source of truth.** The SoT is
-settled (the `agents` row, above). The spike only picks how that row is handed to
-`POST /app-conversations`: an inline `agent` field on the request, vs.
-materializing a per-member saved LLM profile the request references. Both read
-*from* the same authoritative row; `spawn.py` hides the choice behind this
-interface.
+**Spawn transport — spike done (2026-07-02), finding below.** Verified on this
+box:
+- Agent *kind* (openhands vs acp) is sourced from **`user.agent_settings`**, NOT
+  from the start request. `POST /app-conversations` exposes `llm_model` /
+  `agent_type` / `plugins` / `secrets` but **no per-request agent field**.
+  Internally the app already builds a per-conversation `Agent`
+  (`create_agent()` → `create_request(StartConversationRequest, agent=agent)`),
+  so per-conversation agents are fully supported end-to-end — the app just
+  doesn't let a *caller* supply them.
+- An ACP conversation **does launch**: setting `agent_settings` to
+  `{agent_kind:'acp', acp_server:'claude-code', acp_model:'opus[1m]'}` and
+  starting a conversation reached "ACP server initialized: claude-agent-acp"
+  (`@agentclientprotocol/claude-agent-acp@0.44.0` via `npx`). It then failed the
+  session handshake with `Invalid params: 'cwd' must be an absolute path, but
+  received: .` — a **relative-cwd bug in the SDK's ACP integration**
+  (`openhands/sdk/agent/acp_agent.py`), not a fundamental blocker. `CLAUDE_CODE_USE_BEDROCK=1`
+  is already set on the box, so ACP-on-Bedrock auth is available.
+
+  **Consequence — the transport requires a small app_server change, not just
+  config.** Because kind comes from per-user settings, concurrent heterogeneous
+  members (one openhands + one acp at the same time) cannot be expressed by
+  varying the request alone. Phase 2 therefore:
+  1. **Adds a per-request agent-settings override** to `AppConversationStartRequest`
+     (the internal `create_request(..., agent=)` path already accepts it — this
+     just surfaces it on the public API). `spawn.py` sends the member's config
+     from its `agents` row via that field.
+  2. **Fixes the ACP `cwd` bug** (pass the sandbox working dir as an absolute
+     path) so ACP members actually run. Upstream candidate for `software-agent-sdk`.
+  The `agents` row stays the single source of truth; this is only the transport.
 
 Every spawned conversation's `conversation_id` is stored on the comment/event so
 the cockpit can deep-link to the on-disk sandbox events (the reasoning).
+
+**Conversation-completion detection (for the reactive router, P6) — investigated.**
+A conversation exposes `execution_status` (`ConversationExecutionStatus`:
+idle/running/finished/error/...) on `AppConversationInfo`, and the app-server has
+a `/webhooks/events/{conversation_id}` callback the sandbox posts events to. Two
+mechanisms, pick per latency need:
+- **Poll `execution_status`** in the sync loop (simplest; reuses the poller's
+  existing status-poll pattern — the github_poller test already observed
+  `finished`). Default for v1.
+- **Subscribe to the event callback** (push, lower-latency) as an optimization.
+`spawn.py` records the `conversation_id`; the router watches it for
+`finished`/`error` and advances the issue (`in_progress` → `in_review`/`done`, or
+escalate on error).
 
 ---
 
@@ -423,13 +459,17 @@ in-memory sqlite (`:memory:`) per repo convention.
 exactly one event; state cannot change without an event (test asserts the raw
 UPDATE is unreachable outside `store`); `labels_to_state` round-trips.
 
-**P2 — ACP spike + bootstrap.** First run an ACP/Claude-Code conversation on this
-box (close the one real unknown, design §12) and pick the spawn *transport* (§4).
-Then `spawn.py`, `bootstrap.py`.
-✅ *Accept:* spawn an `openhands` member and an `acp` member for a trivial task,
-both return a `conversation_id` and produce output; **each spawn's config is
-derived solely from its `agents` row** (no ad-hoc config — re-spawning the same
-row is reproducible); `bootstrap` creates a `lead` row and, from a formation
+**P2 — Spawn transport + bootstrap.** ACP spike is done (§4): the transport needs
+a small app_server change, not just config. Deliverables:
+(a) add a per-request agent-settings override to `AppConversationStartRequest`
+    (internal `create_request(agent=)` already supports it);
+(b) fix the ACP relative-`cwd` bug in the SDK integration so ACP members run;
+(c) `spawn.py` (reads config from the `agents` row → the new override field);
+(d) `bootstrap.py`.
+✅ *Accept:* spawn an `openhands` member and an `acp` (claude-code) member for a
+trivial task **concurrently**, both return a `conversation_id` and produce output;
+**each spawn's config is derived solely from its `agents` row** (re-spawning the
+same row is reproducible); `bootstrap` creates a `lead` row and, from a formation
 reply, writes ≥1 member row, each as a `form_member` event.
 
 **P3 — Sync bridge.** `sync.py` import-in + label-change detection + publish-out;
