@@ -1,3 +1,4 @@
+import { act } from "@testing-library/react";
 import { beforeAll, describe, expect, it, vi, afterEach } from "vitest";
 import { useTerminal } from "#/hooks/use-terminal";
 import { Command, useCommandStore } from "#/stores/command-store";
@@ -41,6 +42,7 @@ describe("useTerminal", () => {
     open: vi.fn(),
     write: vi.fn(),
     writeln: vi.fn(),
+    clear: vi.fn(),
     dispose: vi.fn(),
     element: document.createElement("div"),
   }));
@@ -70,6 +72,8 @@ describe("useTerminal", () => {
         write = mockTerminal.write;
 
         writeln = mockTerminal.writeln;
+
+        clear = mockTerminal.clear;
 
         dispose = mockTerminal.dispose;
 
@@ -122,5 +126,33 @@ describe("useTerminal", () => {
 
     // Restore original element
     mockTerminal.element = originalElement;
+  });
+
+  it("renders new commands after the command buffer is cleared", () => {
+    // Start with some commands already rendered.
+    useCommandStore.setState({
+      commands: [
+        { content: "echo hello", type: "input" },
+        { content: "hello", type: "output" },
+      ] satisfies Command[],
+    });
+
+    renderWithProviders(<TestTerminalComponent />);
+    expect(mockTerminal.writeln).toHaveBeenCalledWith("hello");
+
+    // Clearing the terminal empties the shared command buffer (this happens
+    // e.g. when switching conversations).
+    act(() => {
+      useCommandStore.getState().clearTerminal();
+    });
+
+    // A new command for the fresh buffer must still render. Previously a stale
+    // write cursor (left pointing past the end of the now-shorter buffer) caused
+    // these to be silently dropped.
+    act(() => {
+      useCommandStore.getState().appendOutput("world");
+    });
+
+    expect(mockTerminal.writeln).toHaveBeenCalledWith("world");
   });
 });

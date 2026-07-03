@@ -70,16 +70,16 @@ const canFitTerminal = (
   return true;
 };
 
-// Create a persistent reference that survives component unmounts
-// This ensures terminal history is preserved when navigating away and back
-const persistentLastCommandIndex = { current: 0 };
-
 export const useTerminal = () => {
   const commands = useCommandStore((state) => state.commands);
   const terminal = React.useRef<Terminal | null>(null);
   const fitAddon = React.useRef<FitAddon | null>(null);
   const ref = React.useRef<HTMLDivElement>(null);
-  const lastCommandIndex = persistentLastCommandIndex; // Use the persistent reference
+  // Tracks how many commands from the store have already been written to this
+  // terminal instance. Per-instance (the terminal is remounted to reset the
+  // XTerm buffer, e.g. when switching conversations), so it must not be shared
+  // across mounts.
+  const lastCommandIndex = React.useRef(0);
   const isDisposed = React.useRef(false);
 
   const createTerminal = () =>
@@ -148,11 +148,21 @@ export const useTerminal = () => {
   }, []);
 
   React.useEffect(() => {
-    if (
-      terminal.current &&
-      commands.length > 0 &&
-      lastCommandIndex.current < commands.length
-    ) {
+    if (!terminal.current) {
+      return;
+    }
+
+    // The command buffer was cleared or truncated (e.g. switching
+    // conversations calls clearTerminal). Reset the XTerm and our write cursor
+    // so the rebuilt buffer renders from the start. Without this, a stale
+    // cursor left pointing past the end of the now-shorter buffer would
+    // silently drop every subsequent command.
+    if (commands.length < lastCommandIndex.current) {
+      terminal.current.clear();
+      lastCommandIndex.current = 0;
+    }
+
+    if (commands.length > lastCommandIndex.current) {
       for (let i = lastCommandIndex.current; i < commands.length; i += 1) {
         if (commands[i].type === "input") {
           terminal.current.write("$ ");
