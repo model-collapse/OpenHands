@@ -5,6 +5,9 @@ import importlib.util
 import io
 import itertools
 import json
+import subprocess
+import sys
+import textwrap
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1073,6 +1076,71 @@ def test_parse_agent_json_rejects_trailing_content():
 
     with pytest.raises(ValueError, match='No valid JSON object found'):
         module.parse_agent_json('prefix {"key":"value"} suffix')
+
+
+# The agent response is a single free-form string, but the same logical object
+# may arrive with different key orderings and surrounding whitespace/fencing
+# from run to run. The parser must map all of those equivalent encodings to the
+# same dict, independent of the interpreter's hash seed, so the classification
+# pipeline does not flake on cosmetic differences in the model output.
+EQUIVALENT_AGENT_JSON_ENCODINGS = [
+    '{"is_duplicate": true, "classification": "duplicate", "confidence": "high"}',
+    '{"confidence": "high", "is_duplicate": true, "classification": "duplicate"}',
+    '```json\n'
+    '{"classification": "duplicate", "confidence": "high", "is_duplicate": true}\n'
+    '```',
+    '  ```json\n'
+    '{"is_duplicate": true, "confidence": "high", "classification": "duplicate"}\n'
+    '```  ',
+]
+
+
+@pytest.mark.parametrize('encoding', EQUIVALENT_AGENT_JSON_ENCODINGS)
+def test_parse_agent_json_is_order_and_whitespace_invariant(encoding):
+    module = load_module('issue_duplicate_check_openhands.py')
+
+    assert module.parse_agent_json(encoding) == {
+        'is_duplicate': True,
+        'classification': 'duplicate',
+        'confidence': 'high',
+    }
+
+
+def test_parse_agent_json_is_stable_across_hash_seeds():
+    """parse_agent_json must be deterministic regardless of PYTHONHASHSEED.
+
+    Dict/set iteration order depends on the hash seed, so a parser that leaked
+    that order into its result would pass under one seed and fail under another
+    (a classic flaky test). Running it in fresh interpreters with different
+    seeds guards against that regression without mocking the real code path.
+    """
+    script = ROOT / 'scripts' / 'issue_duplicate_check_openhands.py'
+    runner = textwrap.dedent(
+        f"""
+        import importlib.util, json, sys
+
+        spec = importlib.util.spec_from_file_location('m', {str(script)!r})
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        encodings = {EQUIVALENT_AGENT_JSON_ENCODINGS!r}
+        results = [module.parse_agent_json(text) for text in encodings]
+        sys.stdout.write(json.dumps(results, sort_keys=True))
+        """
+    )
+
+    outputs = set()
+    for seed in ('0', '1', '42', '12345'):
+        completed = subprocess.run(
+            [sys.executable, '-c', runner],
+            env={'PYTHONHASHSEED': seed, 'PATH': ''},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        outputs.add(completed.stdout)
+
+    assert len(outputs) == 1
 
 
 def test_extract_first_item_handles_list_payload():
